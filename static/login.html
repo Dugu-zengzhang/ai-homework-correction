@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 · AI 智能作业批改平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <div class="auth-wrap">
+    <div class="auth-card">
+      <div class="auth-logo">📘✏️</div>
+      <div class="auth-title">AI 智能作业批改平台</div>
+      <div class="auth-sub">拍照上传 · RAG 知识库检索 · AI 即时批改 · 错题自动整理</div>
+
+      <div class="auth-tabs">
+        <button id="tab-login" class="active" type="button">登录</button>
+        <button id="tab-register" type="button">注册</button>
+      </div>
+
+      <form id="auth-form" onsubmit="return false;">
+        <div class="form-item">
+          <label>用户名</label>
+          <input id="username" placeholder="请输入用户名" autocomplete="username">
+        </div>
+        <div class="form-item">
+          <label>密码</label>
+          <input id="password" type="password" placeholder="请输入密码（至少 6 位）" autocomplete="current-password">
+        </div>
+        <button id="submit-btn" class="btn btn-primary btn-block" type="submit">登 录</button>
+      </form>
+
+      <div class="auth-tip">
+        演示账号：管理员 admin / admin123 ，学生 student / 123456
+      </div>
+    </div>
+  </div>
+  <div id="toast"></div>
+  <script src="/static/js/login.js"></script>
+</body>
+</html>

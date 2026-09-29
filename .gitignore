@@ -1,0 +1,91 @@
+# =========================================================================
+#  AI 智能作业批改 Web 平台 · .gitignore
+#  规则：代码 + 文档入库；运行时数据 / 敏感信息 / 缓存 / IDE 忽略
+# =========================================================================
+
+# ---------------- 1. 敏感 & 运行时配置（绝对不能上传，违反安全规范） ----------------
+api_key.txt
+.env
+.env.*
+!.env.example
+data/settings.json
+data/.secret_key
+data/ai-homework-check_secret.key
+
+# ---------------- 2. 运行时数据库 / 缓存索引 / 用户上传文件（本地动态生成） ----------------
+data/app.db
+data/app.db-journal
+data/rag_index.json
+data/uploads/
+data/knowledge/uploaded/
+# （如需分享样例知识库，请把示例文件手动放到 data/knowledge/ 根目录下，此处不忽略）
+
+# ---------------- 3. Python 字节码 / 缓存 / 虚拟环境 ----------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# ---------------- 4. pytest / 覆盖率报告 ----------------
+.pytest_cache/
+.cache
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# ---------------- 5. 编辑器 / IDE 私有配置（每人机器不一样） ----------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# ---------------- 6. 操作系统缓存文件 ----------------
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ---------------- 7. 临时日志 / 调试文件 ----------------
+*.log
+logs/
+*.bak
+*.tmp
+*.pid
+*.seed

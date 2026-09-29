@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI 智能作业批改平台</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="logo">📘</span>AI 作业批改平台</div>
+    <nav class="nav">
+      <button data-view="grade" class="active">✍️ 作业批改</button>
+      <button data-view="mistakes">📕 我的错题本</button>
+      <button data-view="knowledge" id="nav-knowledge" style="display:none;">📚 知识库管理</button>
+    </nav>
+    <div class="user-box">
+      <span id="username-label"></span>
+      <span id="role-tag" class="role-tag">学生</span>
+      <button class="btn btn-ghost" id="logout-btn" style="padding:6px 14px;">退出</button>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- ============ 作业批改 ============ -->
+    <section class="view active" id="view-grade">
+      <div class="card">
+        <div class="card-title">① 上传作业图片 <span class="sub">支持 JPG / PNG，点击或拖拽上传</span></div>
+        <div class="uploader" id="uploader">
+          <div class="ico">📤</div>
+          <div><strong>点击选择</strong> 或将作业图片拖拽到此处</div>
+          <div class="hint">清晰印刷/工整手写识别效果最佳，识别结果可手动修改</div>
+          <img id="image-preview" class="preview-img" style="display:none;" alt="作业预览">
+        </div>
+        <input type="file" id="image-input" accept="image/*" hidden>
+        <div class="ocr-note" id="ocr-note"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">② 确认题目内容 <span class="sub">OCR 识别结果可直接编辑，也可手动录入题目</span></div>
+        <div class="row">
+          <div class="form-item">
+            <label>学科</label>
+            <select id="subject">
+              <option>数学</option><option>语文</option><option>英语</option>
+              <option>物理</option><option>化学</option><option>综合</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label>年级</label>
+            <select id="grade">
+              <option>小学三年级</option><option>小学四年级</option>
+              <option selected>小学五年级</option><option>小学六年级</option>
+              <option>初中一年级</option><option>初中二年级</option>
+              <option>初中三年级</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-item">
+          <label>题目与作答内容（识别文本，可修改）</label>
+          <textarea id="question-text" rows="7"
+            placeholder="上传图片后这里会自动填入识别文字；也可以直接把题目和你的作答粘贴到这里，例如：&#10;1. 25×4=90（  ）&#10;2. 一个长方形长8cm宽5cm，面积是多少？我算的是35平方厘米。"></textarea>
+        </div>
+        <button class="btn btn-primary" id="grade-btn">🤖 提交 AI 智能批改</button>
+      </div>
+
+      <div class="loading-box" id="grading-box">
+        <div class="spinner"></div>
+        <div>AI 正在检索知识库并逐题批改，请稍候…</div>
+      </div>
+
+      <div id="result-area"></div>
+    </section>
+
+    <!-- ============ 错题本 ============ -->
+    <section class="view" id="view-mistakes">
+      <div class="card">
+        <div class="card-title">📕 我的错题本 <span class="sub">批改后自动收录，仅本人可见</span></div>
+        <div class="filter-bar">
+          <div class="form-item">
+            <label>学科</label>
+            <select id="f-subject">
+              <option value="">全部学科</option>
+              <option>数学</option><option>语文</option><option>英语</option>
+              <option>物理</option><option>化学</option><option>综合</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label>掌握状态</label>
+            <select id="f-mastered">
+              <option value="">全部</option>
+              <option value="0">未掌握</option>
+              <option value="1">已掌握</option>
+            </select>
+          </div>
+          <div class="form-item" style="flex:2;min-width:180px;">
+            <label>关键词（题目 / 知识点）</label>
+            <input id="f-keyword" placeholder="输入关键词筛选">
+          </div>
+          <button class="btn btn-primary" id="filter-btn">筛选</button>
+        </div>
+        <div id="mistake-list"></div>
+      </div>
+    </section>
+
+    <!-- ============ 知识库管理（管理员） ============ -->
+    <section class="view" id="view-knowledge">
+      <div class="stat-grid" id="kb-stats"></div>
+
+      <div class="card">
+        <div class="card-title">📁 知识库文件夹 <span class="sub">把电子版教材、习题答案等文件直接放入该文件夹</span></div>
+        <div class="folder-path" id="folder-path"></div>
+        <button class="btn btn-primary" id="scan-btn">🔄 扫描文件夹并入库</button>
+        <span class="sub" style="color:var(--text-3);margin-left:10px;">支持 txt / md / pdf / docx，新文件自动切片 + 向量化</span>
+      </div>
+
+      <div class="card">
+        <div class="card-title">📤 上传资料文件</div>
+        <div class="uploader" id="kb-uploader">
+          <div class="ico">📚</div>
+          <div><strong>点击选择</strong> 或拖拽电子教材 / 习题资料到此处（可多选）</div>
+          <div class="hint">上传后自动解析、切片、向量化，立即参与 AI 批改检索</div>
+        </div>
+        <input type="file" id="kb-file-input" multiple accept=".txt,.md,.pdf,.docx" hidden>
+        <div id="kb-upload-result"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔍 RAG 检索测试 <span class="sub">输入题目，预览知识库召回的参考资料</span></div>
+        <div class="row">
+          <div class="form-item" style="flex:3;">
+            <input id="search-query" placeholder="例如：长方形面积怎么计算？">
+          </div>
+          <div class="form-item" style="flex:0;">
+            <button class="btn btn-primary" id="search-btn" style="width:100%;">检索</button>
+          </div>
+        </div>
+        <div id="search-result"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🗂️ 已入库资料 <span class="sub" id="doc-count-tip"></span></div>
+        <div id="doc-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">⚙️ DeepSeek 模型设置</div>
+        <div class="row">
+          <div class="form-item" style="flex:2;">
+            <label>API Key</label>
+            <input id="set-apikey" type="password" placeholder="sk-...（留空表示不修改）">
+          </div>
+          <div class="form-item">
+            <label>模型</label>
+            <input id="set-model" placeholder="deepseek-chat">
+          </div>
+        </div>
+        <div class="form-item">
+          <label>接口地址（OpenAI 兼容）</label>
+          <input id="set-baseurl" placeholder="https://api.deepseek.com">
+        </div>
+        <button class="btn btn-primary" id="save-settings-btn">保存设置</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+
+  <div class="modal-mask" id="modal-mask">
+    <div class="modal">
+      <div class="modal-head">
+        <strong id="modal-title">原图预览</strong>
+        <button class="modal-close" id="modal-close">×</button>
+      </div>
+      <div id="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

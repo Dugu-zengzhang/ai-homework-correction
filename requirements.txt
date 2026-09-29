@@ -1,0 +1,9 @@
+Flask>=2.3
+requests>=2.31
+PyJWT>=2.8
+pypdf>=4.0
+
+# 可选：本地 OCR（需另行安装 Tesseract OCR 引擎并配置中文语言包 chi_sim）
+# 未安装时平台自动降级为“手动录入/修正识别文本”，不影响批改主链路
+# pytesseract>=0.3.10
+# pillow>=10.0
