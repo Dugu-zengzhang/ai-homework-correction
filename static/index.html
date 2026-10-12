@@ -39,24 +39,29 @@
 
       <div class="card">
         <div class="card-title">② 确认题目内容 <span class="sub">OCR 识别结果可直接编辑，也可手动录入题目</span></div>
-        <div class="row">
+        <div class="row" id="grade-cascade">
+          <div class="form-item">
+            <label>地区</label>
+            <select id="c-region"></select>
+          </div>
+          <div class="form-item">
+            <label>学段</label>
+            <select id="c-stage"></select>
+          </div>
           <div class="form-item">
             <label>学科</label>
-            <select id="subject">
-              <option>数学</option><option>语文</option><option>英语</option>
-              <option>物理</option><option>化学</option><option>综合</option>
-            </select>
+            <select id="c-subject"></select>
+          </div>
+          <div class="form-item">
+            <label>教材版本</label>
+            <select id="c-textbook"></select>
           </div>
           <div class="form-item">
             <label>年级</label>
-            <select id="grade">
-              <option>小学三年级</option><option>小学四年级</option>
-              <option selected>小学五年级</option><option>小学六年级</option>
-              <option>初中一年级</option><option>初中二年级</option>
-              <option>初中三年级</option>
-            </select>
+            <select id="c-grade"></select>
           </div>
         </div>
+        <div class="ocr-note" id="dict-note"></div>
         <div class="form-item">
           <label>题目与作答内容（识别文本，可修改）</label>
           <textarea id="question-text" rows="7"
@@ -79,12 +84,20 @@
         <div class="card-title">📕 我的错题本 <span class="sub">批改后自动收录，仅本人可见</span></div>
         <div class="filter-bar">
           <div class="form-item">
+            <label>学段</label>
+            <select id="f-stage"></select>
+          </div>
+          <div class="form-item">
             <label>学科</label>
-            <select id="f-subject">
-              <option value="">全部学科</option>
-              <option>数学</option><option>语文</option><option>英语</option>
-              <option>物理</option><option>化学</option><option>综合</option>
-            </select>
+            <select id="f-subject"></select>
+          </div>
+          <div class="form-item">
+            <label>教材版本</label>
+            <select id="f-textbook"></select>
+          </div>
+          <div class="form-item">
+            <label>年级</label>
+            <select id="f-grade"></select>
           </div>
           <div class="form-item">
             <label>掌握状态</label>

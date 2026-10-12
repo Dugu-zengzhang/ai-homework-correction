@@ -69,6 +69,182 @@ $("modal-mask").onclick = (e) => {
   if (e.target === $("modal-mask")) $("modal-mask").classList.remove("show");
 };
 
+/* ============ 五级级联选择器（T-B03：地区→学段→学科→教材版本→年级） ============ */
+/*
+ * 字典接口约定（T-B01，见任务卡片第九节）：GET /api/dict，按上级取值返回下级候选：
+ *   无参数                          → { regions: {省:[市…]}, stages: [...], defaults: {...} }
+ *   ?stage=初中                     → { subjects: [...] }（subjects[stage]，小学不含物理/化学/生物）
+ *   ?stage=初中&subject=数学        → { textbooks: [...] }（textbooks[stage]，按学段下发）
+ *   ?stage=初中&textbook=人教版     → { grades: [...] }（grades[stage]）
+ * 接口未就绪（404/500/网络异常）时自动降级为前端内置字典，保证页面可用、不白屏。
+ * 内置字典与 data/dict.json 初始骨架保持一致；/api/dict 上线后自动切换为服务端数据。
+ */
+const FALLBACK_DICT = {
+  regions: ["福建省", "广东省", "江苏省", "浙江省"],
+  stages: ["小学", "初中", "高中"],
+  subjects: {
+    "小学": ["语文", "数学", "英语", "科学", "道德与法治"],
+    "初中": ["语文", "数学", "英语", "物理", "化学", "生物", "道德与法治", "历史", "地理"],
+    "高中": ["语文", "数学", "英语", "物理", "化学", "生物", "思想政治", "历史", "地理"],
+  },
+  textbooksByStage: {
+    "小学": ["人教版", "北师大版", "苏教版", "沪教版"],
+    "初中": ["人教版", "人教版（2024）", "北师大版", "北师大版（2024）", "华东师大版", "苏科版", "沪科版"],
+    "高中": ["人教版", "苏教版", "北师大版", "沪科版"],
+  },
+  grades: {
+    "小学": ["一年级上", "一年级下", "二年级上", "二年级下", "三年级上", "三年级下",
+             "四年级上", "四年级下", "五年级上", "五年级下", "六年级上", "六年级下"],
+    "初中": ["七年级上", "七年级下", "八年级上", "八年级下", "九年级上", "九年级下"],
+    "高中": ["高一上", "高一下", "高二上", "高二下", "高三上", "高三下"],
+  },
+};
+// 系统默认选择（与 dict.json 骨架 defaults 一致）：福建省 / 初中 / 数学 / 人教版 / 七年级上
+const CASCADE_SYS_DEFAULT = { region: "福建省", stage: "初中", subject: "数学", textbook: "人教版", grade: "七年级上" };
+
+let dictRemoteOK = null; // null=未探测，true=接口可用，false=已降级
+/* 探测字典接口根节点：返回原始对象（含 regions/stages/defaults），失败返回 null */
+async function dictRoot() {
+  try {
+    const data = await api("/api/dict");
+    if (data && typeof data === "object") { dictRemoteOK = true; return data; }
+  } catch (e) { /* 接口未就绪，走内置字典 */ }
+  dictRemoteOK = false;
+  return null;
+}
+/* 拉取下级候选：优先服务端，异常或缺字段时回退内置字典 */
+async function dictOptions(key, query, fallback) {
+  try {
+    const data = await api("/api/dict?" + new URLSearchParams(query).toString());
+    const arr = Array.isArray(data) ? data : data[key];
+    if (Array.isArray(arr) && arr.length) { dictRemoteOK = true; return arr; }
+  } catch (e) { /* 接口未就绪，走内置字典 */ }
+  dictRemoteOK = false;
+  return fallback;
+}
+
+const fbSubjects = (stage) => FALLBACK_DICT.subjects[stage] || [];
+const fbTextbooks = (stage) => FALLBACK_DICT.textbooksByStage[stage] || [];
+const fbGrades = (stage) => FALLBACK_DICT.grades[stage] || [];
+const fbAllSubjects = () => [...new Set(Object.values(FALLBACK_DICT.subjects).flat())];
+const fbAllTextbooks = () => [...new Set(Object.values(FALLBACK_DICT.textbooksByStage).flat())];
+const fbAllGrades = () => [...new Set(Object.values(FALLBACK_DICT.grades).flat())];
+
+function fillSelect(sel, items, allLabel) {
+  sel.innerHTML = "";
+  if (allLabel) sel.append(new Option(allLabel, ""));
+  items.forEach((t) => sel.append(new Option(t, t)));
+}
+
+function updateDictNote() {
+  const note = $("dict-note");
+  if (!note) return;
+  note.textContent = dictRemoteOK === false
+    ? "⚠️ 字典接口未就绪，当前使用前端内置字典；/api/dict 上线后将自动切换为服务端数据。"
+    : "";
+}
+
+/*
+ * 通用五级级联。opts.all=true 时每级带“全部”选项（错题筛选栏）；
+ * opts.prefKey 非空时持久化上次选择并按“上次选择 > 系统默认”恢复（批改页）。
+ * 上级变更时下级选项整体重建（收窄），不残留脏值。
+ */
+function setupCascade(ids, opts = {}) {
+  const el = {
+    region: ids.region ? $(ids.region) : null,
+    stage: $(ids.stage), subject: $(ids.subject),
+    textbook: $(ids.textbook), grade: $(ids.grade),
+  };
+  const all = opts.all ? { stage: "全部学段", subject: "全部学科", textbook: "全部版本", grade: "全部年级" } : {};
+
+  async function refreshSubjects(preset) {
+    const stage = el.stage.value;
+    const subs = (!stage && all.stage)
+      ? fbAllSubjects()
+      : await dictOptions("subjects", { stage }, fbSubjects(stage));
+    fillSelect(el.subject, subs, all.subject);
+    if (preset && subs.includes(preset)) el.subject.value = preset;
+    await refreshTextbooks();
+  }
+  async function refreshTextbooks(preset) {
+    const stage = el.stage.value, subject = el.subject.value;
+    const tbs = (!subject && all.subject)
+      ? (stage ? fbTextbooks(stage) : fbAllTextbooks())
+      : await dictOptions("textbooks", { stage, subject }, fbTextbooks(stage));
+    fillSelect(el.textbook, [...new Set(tbs)], all.textbook);
+    if (preset && [...el.textbook.options].some((o) => o.value === preset)) el.textbook.value = preset;
+    await refreshGrades();
+  }
+  async function refreshGrades(preset) {
+    const stage = el.stage.value;
+    const grades = (!stage && all.stage)
+      ? fbAllGrades()
+      : await dictOptions("grades",
+          { stage, subject: el.subject.value, textbook: el.textbook.value }, fbGrades(stage));
+    fillSelect(el.grade, grades, all.grade);
+    if (preset && grades.includes(preset)) el.grade.value = preset;
+  }
+
+  function current() {
+    return {
+      region: el.region ? el.region.value : "",
+      stage: el.stage.value, subject: el.subject.value,
+      textbook: el.textbook.value, grade: el.grade.value,
+    };
+  }
+  function savePref() {
+    if (opts.prefKey) localStorage.setItem(opts.prefKey, JSON.stringify(current()));
+  }
+
+  el.stage.onchange = () => { refreshSubjects(); savePref(); };
+  el.subject.onchange = () => { refreshTextbooks(); savePref(); };
+  el.textbook.onchange = () => { refreshGrades(); savePref(); };
+  el.grade.onchange = savePref;
+  if (el.region) el.region.onchange = savePref;
+
+  async function init() {
+    // 一次根节点探测：regions（对象则取省名）/ stages / defaults；失败走内置字典
+    const root = await dictRoot();
+    const regionsRaw = root && root.regions;
+    const regions = regionsRaw
+      ? (Array.isArray(regionsRaw) ? regionsRaw : Object.keys(regionsRaw))
+      : FALLBACK_DICT.regions;
+    const stages = (root && Array.isArray(root.stages) && root.stages.length)
+      ? root.stages : FALLBACK_DICT.stages;
+    const sysDefault = (root && root.defaults && typeof root.defaults === "object")
+      ? Object.assign({}, CASCADE_SYS_DEFAULT, root.defaults) : CASCADE_SYS_DEFAULT;
+    const pref = opts.prefKey
+      ? (JSON.parse(localStorage.getItem(opts.prefKey) || "null") || sysDefault)
+      : null;
+    if (el.region) {
+      fillSelect(el.region, regions);
+      if (pref && regions.includes(pref.region)) el.region.value = pref.region;
+    }
+    fillSelect(el.stage, stages, all.stage);
+    if (pref && stages.includes(pref.stage)) el.stage.value = pref.stage;
+    await refreshSubjects(pref && pref.subject);
+    if (pref && [...el.textbook.options].some((o) => o.value === pref.textbook)) {
+      el.textbook.value = pref.textbook;
+      await refreshGrades();
+      if ([...el.grade.options].some((o) => o.value === pref.grade)) el.grade.value = pref.grade;
+    }
+    updateDictNote();
+  }
+  return { init, current, el };
+}
+
+/* 批改页级联（记忆上次选择）与错题筛选级联（各级可选“全部”） */
+const gradeCascade = setupCascade(
+  { region: "c-region", stage: "c-stage", subject: "c-subject", textbook: "c-textbook", grade: "c-grade" },
+  { prefKey: "cascade_pref" }
+);
+const filterCascade = setupCascade(
+  { stage: "f-stage", subject: "f-subject", textbook: "f-textbook", grade: "f-grade" },
+  { all: true }
+);
+gradeCascade.init();
+filterCascade.init();
+
 /* ============ 作业批改 ============ */
 const uploader = $("uploader");
 const imageInput = $("image-input");
@@ -112,11 +288,16 @@ $("grade-btn").onclick = async () => {
   $("result-area").innerHTML = "";
   $("grade-btn").disabled = true;
   try {
+    const sel = gradeCascade.current();
     const data = await api("/api/homework/grade", {
       method: "POST",
       jsonBody: {
-        subject: $("subject").value,
-        grade: $("grade").value,
+        // 完整五级参数（T-B03）；stage/textbook_version/region 待 T-B02 落地后由后端消费
+        region: sel.region,
+        stage: sel.stage,
+        subject: sel.subject,
+        textbook_version: sel.textbook,
+        grade: sel.grade,
         question_text: text,
         image_name: currentImage ? currentImage.image_name : null,
       },
@@ -187,8 +368,13 @@ function renderResult(data) {
 $("filter-btn").onclick = loadMistakes;
 
 async function loadMistakes() {
+  const fsel = filterCascade.current();
   const params = new URLSearchParams({
-    subject: $("f-subject").value,
+    // 多级筛选（T-B03）；stage/grade/textbook_version 待 T-B02 后由后端生效，subject 立即生效
+    stage: fsel.stage,
+    subject: fsel.subject,
+    grade: fsel.grade,
+    textbook_version: fsel.textbook,
     mastered: $("f-mastered").value,
     keyword: $("f-keyword").value.trim(),
   });
@@ -205,6 +391,7 @@ async function loadMistakes() {
         <div class="mistake-head">
           <div>
             <span class="kp-tag">${escapeHtml(m.subject || "综合")}</span>
+            ${m.grade ? `<span class="kp-tag">${escapeHtml(m.grade)}</span>` : ""}
             ${m.knowledge_point ? `<span class="kp-tag">🔖 ${escapeHtml(m.knowledge_point)}</span>` : ""}
             <span class="mistake-meta">${escapeHtml(m.created_at)}</span>
           </div>
