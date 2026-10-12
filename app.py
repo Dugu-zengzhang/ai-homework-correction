@@ -257,6 +257,10 @@ def homework_grade():
     data = request.get_json(silent=True) or {}
     subject = (data.get("subject") or "综合").strip()
     grade = (data.get("grade") or "").strip()
+    # T-B05：学段 / 教材版本（五级级联需求的中期修改），用于 RAG 标签过滤；
+    # 未传时降级为原有全库检索行为，保持向后兼容
+    stage = (data.get("stage") or "").strip()
+    textbook_version = (data.get("textbook_version") or "").strip()
     question_text = (data.get("question_text") or "").strip()
     image_name = data.get("image_name")
     if image_name:
@@ -266,8 +270,12 @@ def homework_grade():
     if not question_text:
         return fail("作业题目内容为空，请识别或手动录入后再提交")
 
-    # RAG 召回
-    contexts = rag_engine.search(question_text)
+    # RAG 召回（按学段 / 教材版本过滤，避免跨学段资料串库）
+    contexts = rag_engine.search(
+        question_text,
+        stage=stage or None,
+        textbook_version=textbook_version or None,
+    )
 
     # AI 批改
     try:
@@ -418,6 +426,9 @@ def knowledge_upload():
     files = request.files.getlist("files")
     if not files:
         return fail("请选择要上传的资料文件")
+    # T-B05：上传时可携带学段 / 教材版本标签（可选），入库时打在文档与切片上
+    stage = (request.form.get("stage") or "").strip()
+    textbook_version = (request.form.get("textbook_version") or "").strip()
     upload_dir = os.path.join(str(config.KNOWLEDGE_DIR), "uploaded")
     os.makedirs(upload_dir, exist_ok=True)
     results = []
@@ -433,7 +444,9 @@ def knowledge_upload():
         path = os.path.join(upload_dir, safe_name)
         file.save(path)
         try:
-            doc = rag_engine.add_file(path, source="upload")
+            doc = rag_engine.add_file(path, source="upload",
+                                      stage=stage or None,
+                                      textbook_version=textbook_version or None)
             results.append({"filename": original, "ok": True,
                             "msg": f"已入库，{doc['chunk_count']} 个切片"})
         except Exception as exc:
@@ -462,12 +475,36 @@ def knowledge_delete(doc_id):
 @app.post("/api/knowledge/search")
 @auth_required
 def knowledge_search():
-    """检索测试 / 供预览 RAG 召回效果。"""
+    """检索测试 / 供预览 RAG 召回效果。支持学段 / 教材版本标签过滤（T-B05）。"""
     data = request.get_json(silent=True) or {}
     query = (data.get("query") or "").strip()
     if not query:
         return fail("请输入检索内容")
-    return ok(rag_engine.search(query))
+    return ok(rag_engine.search(
+        query,
+        stage=(data.get("stage") or "").strip() or None,
+        textbook_version=(data.get("textbook_version") or "").strip() or None,
+    ))
+
+
+@app.put("/api/knowledge/<int:doc_id>/labels")
+@admin_required
+def knowledge_update_labels(doc_id):
+    """T-B05：为已入库资料补打 / 更新学段、教材版本标签（旧数据治理）。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        doc = rag_engine.update_doc_labels(
+            doc_id,
+            stage=data.get("stage"),
+            textbook_version=data.get("textbook_version"),
+        )
+    except KeyError:
+        return fail("资料不存在", 404, 404)
+    return ok({
+        "id": doc["id"], "filename": doc["filename"],
+        "stage": doc.get("stage") or None,
+        "textbook_version": doc.get("textbook_version") or None,
+    }, "标签已更新")
 
 
 # ========================= 模型设置（管理员） =========================

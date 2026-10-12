@@ -6,9 +6,15 @@
 2. 切片入库：按段落 + 定长滑窗切片（带重叠），防止知识点被截断；
 3. 向量化：本地 TF-IDF（中英文混合分词：英文按词、中文按字 + 二元词组），
    完全离线可用；如后续需要语义向量，可替换 Embedder 而业务层不变；
-4. 检索：余弦相似度 TopN 召回 + 低分过滤，供大模型 Prompt 组装上下文。
+4. 检索：余弦相似度 TopN 召回 + 低分过滤，供大模型 Prompt 组装上下文；
+5. 标签过滤（T-B05）：入库时为切片打学段（stage）/ 教材版本（textbook_version）标签，
+   检索时先按标签过滤再做相似度计算，避免小学题召回初中资料。
 
-索引持久化在 data/rag_index.json，向量在加载/更新时重建。
+索引持久化在 data/rag_index.json，向量在加载/更新时重建，标签随索引一并持久化。
+
+旧数据兼容策略：无标签（或标签为空）的切片视为「通用资料」，在任何过滤条件下
+都参与召回；只有显式带了不匹配标签的切片才会被过滤掉。这样旧索引升级后
+不报错、不退化为空库，管理员可通过 update_doc_labels 逐步补打标签。
 """
 import json
 import math
@@ -175,6 +181,21 @@ class TfidfEmbedder:
 
 # ----------------------------- RAG 引擎 -----------------------------
 
+def _norm_label(value) -> str:
+    """标签归一化：None / 空白字符串统一为 ''（表示未打标签）。"""
+    return (value or "").strip()
+
+
+def _label_match(chunk_label: str, filter_value: str) -> bool:
+    """过滤规则：不过滤（filter 为空）→ 放行；切片无标签 → 通用资料放行；
+    切片有标签 → 必须与过滤值完全一致。"""
+    if not filter_value:
+        return True
+    if not chunk_label:
+        return True
+    return chunk_label == filter_value
+
+
 class RAGEngine:
     def __init__(self, index_path: str = None, knowledge_dir: str = None):
         self.index_path = index_path or str(config.INDEX_PATH)
@@ -213,8 +234,15 @@ class RAGEngine:
         self.vectors = [self.embedder.vectorize(t) for t in tokens]
 
     # -------- 入库 --------
-    def add_file(self, path: str, source: str = "upload") -> dict:
-        """解析 + 切片 + 入库。同一路径重复导入会覆盖旧版本。"""
+    def add_file(self, path: str, source: str = "upload",
+                 stage: str = None, textbook_version: str = None) -> dict:
+        """解析 + 切片 + 入库。同一路径重复导入会覆盖旧版本。
+
+        stage / textbook_version：学段、教材版本标签（T-B05），同时写在
+        文档与其全部切片上，随索引持久化；不传则为无标签「通用资料」。
+        """
+        stage = _norm_label(stage)
+        textbook_version = _norm_label(textbook_version)
         with self._lock:
             path = os.path.abspath(path)
             settings = config.load_settings()
@@ -236,6 +264,8 @@ class RAGEngine:
                 "filename": os.path.basename(path),
                 "path": path,
                 "source": source,
+                "stage": stage,
+                "textbook_version": textbook_version,
                 "chunk_count": len(pieces),
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -246,6 +276,8 @@ class RAGEngine:
                     "doc_id": doc_id,
                     "chunk_index": idx,
                     "content": piece,
+                    "stage": stage,
+                    "textbook_version": textbook_version,
                 })
             self.docs.append(doc)
             self._save()
@@ -300,8 +332,40 @@ class RAGEngine:
         self.docs = [d for d in self.docs if d["id"] != doc_id]
         self.chunks = [c for c in self.chunks if c["doc_id"] != doc_id]
 
+    # -------- 标签维护（T-B05） --------
+    def update_doc_labels(self, doc_id: int, stage: str = None,
+                          textbook_version: str = None) -> dict:
+        """为已入库的文档（及其全部切片）补打 / 更新学段、教材版本标签。
+
+        用于旧索引无标签数据的治理：管理员在知识库管理页选定资料后补标，
+        标签随索引持久化，重载后不丢失。传空字符串表示清除标签（恢复为
+        通用资料）。文档不存在时抛 KeyError。
+        """
+        stage = _norm_label(stage)
+        textbook_version = _norm_label(textbook_version)
+        with self._lock:
+            doc = next((d for d in self.docs if d["id"] == doc_id), None)
+            if not doc:
+                raise KeyError(f"文档不存在：doc_id={doc_id}")
+            doc["stage"] = stage
+            doc["textbook_version"] = textbook_version
+            for chunk in self.chunks:
+                if chunk["doc_id"] == doc_id:
+                    chunk["stage"] = stage
+                    chunk["textbook_version"] = textbook_version
+            self._save()
+            return doc
+
     # -------- 检索 --------
-    def search(self, query: str, top_k: int = None, min_score: float = None) -> list:
+    def search(self, query: str, top_k: int = None, min_score: float = None,
+               stage: str = None, textbook_version: str = None) -> list:
+        """检索：先按 stage / textbook_version 标签过滤，再做 TF-IDF 相似度计算。
+
+        标签过滤规则见 _label_match：无标签切片视为通用资料，任何过滤
+        条件下均可召回；过滤参数为空时行为与旧版本完全一致（全库检索）。
+        """
+        stage = _norm_label(stage)
+        textbook_version = _norm_label(textbook_version)
         with self._lock:
             if not self.chunks:
                 return []
@@ -313,6 +377,13 @@ class RAGEngine:
             qv = self.embedder.vectorize(tokenize(query))
             scored = []
             for chunk, vec in zip(self.chunks, self.vectors):
+                # 先按标签过滤（T-B05）：不匹配的切片不参与相似度计算
+                if not _label_match(_norm_label(chunk.get("stage")), stage):
+                    continue
+                if not _label_match(
+                    _norm_label(chunk.get("textbook_version")), textbook_version
+                ):
+                    continue
                 score = TfidfEmbedder.cosine(qv, vec)
                 if score >= min_score:
                     scored.append((score, chunk))
@@ -327,6 +398,10 @@ class RAGEngine:
                     "chunk_index": chunk["chunk_index"],
                     "content": chunk["content"],
                     "score": round(float(score), 4),
+                    "stage": _norm_label(chunk.get("stage")) or None,
+                    "textbook_version": (
+                        _norm_label(chunk.get("textbook_version")) or None
+                    ),
                 })
             return results
 
