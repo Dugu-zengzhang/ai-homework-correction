@@ -75,6 +75,35 @@ class TestOCRBoundary:
         assert "手动" in result["note"] or "录入" in result["note"]
 
     @pytest.mark.unit
+    def test_ocr_missing_engine_has_distinct_note(self, tmp_path, monkeypatch):
+        """D-06：缺 Tesseract 引擎（而非缺依赖）时，note 应明确指向引擎安装。"""
+        import types
+
+        fake = types.ModuleType("pytesseract")
+
+        class TesseractNotFoundError(Exception):
+            pass
+
+        fake.TesseractNotFoundError = TesseractNotFoundError
+
+        def _raise(*_a, **_k):
+            raise TesseractNotFoundError("tesseract is not installed")
+
+        fake.image_to_string = _raise
+        monkeypatch.setitem(sys.modules, "pytesseract", fake)
+
+        from ocr_service import ocr_image
+        real = tmp_path / "real.png"
+        # 真实的最小 1x1 PNG，确保 PIL 能成功打开，从而进入 image_to_string 分支
+        real.write_bytes(bytes.fromhex(
+            "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+            "0000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082"
+        ))
+        result = ocr_image(str(real))
+        assert result["engine"] == "manual"
+        assert "引擎" in result["note"]
+
+    @pytest.mark.unit
     def test_clean_ocr_text_garbled_and_control_chars(self):
         """OCR-08：乱码（锟斤拷）与控制字符输入清洗 → 不崩溃、返回字符串。"""
         from ocr_service import clean_ocr_text

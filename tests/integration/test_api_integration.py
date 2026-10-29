@@ -82,6 +82,23 @@ class TestAuth:
         assert resp.status_code == 401
         assert j(resp)["code"] != 0
 
+    @pytest.mark.integration
+    def test_login_locked_after_repeated_failures(self, client, monkeypatch):
+        """D-03：同账号连续失败 5 次触发临时锁定，锁定期间即使密码正确也拒绝。"""
+        import app as app_module
+        monkeypatch.setattr(app_module, "_login_attempts", {})
+        client.post("/api/auth/register", json={"username": "lockme", "password": "123456"})
+
+        for _ in range(4):
+            r = client.post("/api/auth/login", json={"username": "lockme", "password": "bad"})
+            assert r.status_code == 401
+
+        r = client.post("/api/auth/login", json={"username": "lockme", "password": "bad"})
+        assert r.status_code == 429, "第 5 次失败应锁定"
+
+        r = client.post("/api/auth/login", json={"username": "lockme", "password": "123456"})
+        assert r.status_code == 429, "锁定期间正确密码也应被拒"
+
     # --- AUTH-07 未登录访问业务接口 ---
     @pytest.mark.integration
     def test_access_mistakes_without_token_is_401(self, client):
@@ -226,6 +243,45 @@ class TestHomeworkGradeAPI:
         assert data["code"] != 0, "无 Key 时批改不能成功"
         assert "DeepSeek" in data.get("msg", "") or "API Key" in data.get("msg", "")
 
+    @pytest.mark.integration
+    def test_grade_invalid_region_rejected(self, client, student_headers):
+        """字典外的地区一律拒绝（整改项 CR-15：region 此前未参与校验）。"""
+        resp = client.post("/api/homework/grade",
+                           headers=student_headers,
+                           json={"subject": "数学", "grade": "七年级上", "stage": "初中",
+                                 "textbook_version": "人教版", "region": "火星省",
+                                 "question_text": "1+1=？ 学生答案=2"})
+        data = j(resp)
+        assert data["code"] != 0
+        assert "地区" in data.get("msg", "")
+
+    @pytest.mark.integration
+    def test_grade_internal_error_logged(self, client, student_headers, monkeypatch):
+        """D-11：批改接口内部异常必须落日志，且仍返回统一错误文案。"""
+        import llm_service as llm_mod
+        import app as app_module
+
+        def boom(*_a, **_k):
+            raise RuntimeError("模拟内部异常")
+
+        monkeypatch.setattr(llm_mod, "grade_homework", boom)
+
+        logged = []
+
+        class _FakeLogger:
+            def exception(self, *a, **k):
+                logged.append((a, k))
+
+        monkeypatch.setattr(app_module, "logger", _FakeLogger())
+
+        resp = client.post("/api/homework/grade", headers=student_headers,
+                           json={"subject": "数学", "grade": "五年级",
+                                 "question_text": "1+1=？ 学生答案=2"})
+        body = j(resp)
+        assert body["code"] != 0
+        assert "批改服务暂时不可用" in body.get("msg", "")
+        assert logged, "内部异常应被记录到日志"
+
 
 # =====================================================================
 # 错题 CRUD Epic-05
@@ -309,6 +365,67 @@ class TestMistakesCRUD:
         resp = client.get("/api/mistakes?keyword=分数", headers=student_headers)
         items = j(resp)["data"]
         assert len(items) == 1 and items[0]["question"] == "分数加法题"
+
+    @pytest.mark.integration
+    def test_filter_by_textbook_version(self, client, student_headers, sandbox_config):
+        """E2E-05：教材版本筛选（整改项 CR-13：前端发 textbook_version，后端曾只读 textbook）。"""
+        import config, sqlite3
+        db_path = str(config.DB_PATH)
+        conn = sqlite3.connect(db_path)
+        uid = conn.execute("SELECT id FROM users WHERE username='student'").fetchone()[0]
+        for name, tb in (("人教版题目", "人教版"), ("苏科版题目", "苏科版")):
+            conn.execute(
+                "INSERT INTO mistakes (user_id, subject, grade, stage, textbook_version,"
+                " question, correct_answer, knowledge_point, mastered, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,0,?)",
+                (uid, "数学", "七年级上", "初中", tb, name, "参考答案", "X",
+                 "2026-01-01 00:00:00"),
+            )
+        conn.commit()
+        conn.close()
+
+        # 前端实际提交的参数名
+        items = j(client.get("/api/mistakes?textbook_version=人教版",
+                             headers=student_headers))["data"]
+        assert len(items) == 1, f"教材版本筛选失效：{items}"
+        assert items[0]["question"] == "人教版题目"
+
+        # 旧参数名仍兼容
+        items_legacy = j(client.get("/api/mistakes?textbook=苏科版",
+                                    headers=student_headers))["data"]
+        assert len(items_legacy) == 1
+        assert items_legacy[0]["question"] == "苏科版题目"
+
+    @pytest.mark.integration
+    def test_list_mistakes_paginated(self, client, student_headers, sandbox_config):
+        """D-08：传分页参数返回 {items,total,page,page_size}；不传则保持旧数组行为。"""
+        import config, sqlite3
+        db_path = str(config.DB_PATH)
+        conn = sqlite3.connect(db_path)
+        uid = conn.execute("SELECT id FROM users WHERE username='student'").fetchone()[0]
+        conn.close()
+        self._insert_mistakes(db_path, uid, [
+            ("数学", "分页题1", 0, "X"),
+            ("数学", "分页题2", 0, "X"),
+            ("数学", "分页题3", 0, "X"),
+        ])
+
+        data = j(client.get("/api/mistakes?page=1&page_size=2",
+                            headers=student_headers))["data"]
+        assert isinstance(data, dict)
+        assert data["total"] == 3
+        assert data["page"] == 1
+        assert data["page_size"] == 2
+        assert len(data["items"]) == 2
+
+        # 第 2 页只剩 1 条
+        data2 = j(client.get("/api/mistakes?page=2&page_size=2",
+                             headers=student_headers))["data"]
+        assert len(data2["items"]) == 1
+
+        # 不传分页参数 → 旧行为：返回数组
+        legacy = j(client.get("/api/mistakes", headers=student_headers))["data"]
+        assert isinstance(legacy, list)
 
     @pytest.mark.integration
     def test_toggle_mastered_updates_db(self, client, student_headers, sandbox_config):
@@ -415,6 +532,27 @@ class TestKnowledgeAPI:
         assert got["top_k"] == 10
 
     @pytest.mark.integration
+    def test_settings_reject_overlap_ge_chunk_size(self, client, admin_headers):
+        """D-01：chunk_overlap 不小于 chunk_size 时拒绝，避免切片步长退化为 1。"""
+        resp = client.put("/api/settings", headers=admin_headers,
+                          json={"chunk_size": 200, "chunk_overlap": 300})
+        assert j(resp)["code"] != 0
+        assert "chunk_overlap" in j(resp).get("msg", "")
+
+    @pytest.mark.integration
+    def test_settings_reject_out_of_range_values(self, client, admin_headers):
+        """D-01：top_k / min_score 越界时拒绝。"""
+        for payload, key in (
+            ({"top_k": 0}, "top_k"),
+            ({"top_k": 99}, "top_k"),
+            ({"min_score": 1.5}, "min_score"),
+            ({"chunk_size": 10}, "chunk_size"),
+        ):
+            resp = client.put("/api/settings", headers=admin_headers, json=payload)
+            assert j(resp)["code"] != 0, f"{payload} 应被拒绝"
+            assert key in j(resp).get("msg", "")
+
+    @pytest.mark.integration
     def test_knowledge_search_returns_expected_structure(self, client, admin_headers, rag_engine_sandbox,
                                                           sandbox_config, tmp_path):
         """知识库检索测试接口结构：{doc_id, doc_name, chunk_index, content, score}。"""
@@ -432,3 +570,64 @@ class TestKnowledgeAPI:
             for k in ("doc_id", "doc_name", "chunk_index", "content", "score"):
                 assert k in first, f"检索结果缺少字段 {k}"
             assert 0.0 <= first["score"] <= 1.0
+
+
+# =====================================================================
+# 作业原图访问控制（整改项 CR-14：/uploads 曾完全公开）
+# =====================================================================
+class TestUploadImageAccess:
+    """作业原图必须登录后可读，且仅本人与管理员可读。"""
+
+    IMAGE = "audit_cr14.png"
+
+    @staticmethod
+    def _prepare(sandbox_config):
+        """在沙箱上传目录放一张图，并给 student 落一条批改记录指向它。"""
+        import config, sqlite3
+
+        (Path(sandbox_config["UPLOAD_DIR"]) / TestUploadImageAccess.IMAGE).write_bytes(
+            b"\x89PNG\r\n\x1a\n fake image bytes"
+        )
+        conn = sqlite3.connect(str(config.DB_PATH))
+        uid = conn.execute("SELECT id FROM users WHERE username='student'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO records (user_id, subject, grade, stage, textbook_version,"
+            " image_path, question_text, score, result_json, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (uid, "数学", "七年级上", "初中", "人教版", TestUploadImageAccess.IMAGE,
+             "题目", "", "{}", "2026-01-01 00:00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+    @pytest.mark.integration
+    def test_anonymous_access_rejected(self, client, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}")
+        assert resp.status_code == 401
+
+    @pytest.mark.integration
+    def test_owner_can_read_image(self, client, student_headers, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}", headers=student_headers)
+        assert resp.status_code == 200
+        assert resp.data.startswith(b"\x89PNG")
+
+    @pytest.mark.integration
+    def test_other_user_forbidden(self, client, bob_headers, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}", headers=bob_headers)
+        assert resp.status_code == 403
+
+    @pytest.mark.integration
+    def test_admin_can_read_image(self, client, admin_headers, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}", headers=admin_headers)
+        assert resp.status_code == 200
+
+    @pytest.mark.integration
+    def test_token_query_param_accepted(self, client, student_token, sandbox_config):
+        """<img src> 无法带请求头，因此 ?token= 也必须可用。"""
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}?token={student_token}")
+        assert resp.status_code == 200

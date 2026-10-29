@@ -135,7 +135,8 @@ def check_dependencies():
 
     if missing_optional:
         warn(f"可选依赖未安装：{', '.join(p.split('>=')[0] for p in missing_optional)}")
-        info("  如果需要本地 OCR，安装后再重启本脚本即可；跳过也不影响 AI 批改主链路。")
+        info("  如需本地 OCR，执行 pip install -r requirements-ocr.txt 并安装 Tesseract 引擎；")
+        info("  跳过也不影响 AI 批改主链路（会自动降级为手动录入识别文本）。")
 
     return True
 

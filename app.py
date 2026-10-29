@@ -8,8 +8,10 @@
 import datetime
 from datetime import timezone as _dt_timezone
 import json
+import logging
 import os
 import sqlite3
+import time
 import uuid
 from functools import wraps
 
@@ -19,11 +21,26 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 import config
+import dict_service
 import llm_service
 import ocr_service
 from rag_engine import rag_engine
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+# 批改链路运行日志（D-11）：写入 logs/app.log，目录已被 .gitignore 忽略
+logger = logging.getLogger("ai_homework_check")
+if not logger.handlers:
+    _log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _handler = logging.FileHandler(
+        os.path.join(_log_dir, "app.log"), encoding="utf-8"
+    )
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 # ========================= 数据库 =========================
@@ -43,6 +60,34 @@ def close_db(_exc):
         db.close()
 
 
+# 表结构升级计划：旧库补齐新增列（幂等，可重复执行）
+_SCHEMA_UPGRADES = {
+    "records": ["stage", "textbook_version", "region"],
+    "mistakes": ["grade", "stage", "textbook_version"],
+}
+
+
+def _migrate_db(db):
+    """为已存在的旧库补齐新增字段，并回填可推断的学段；幂等，可重复执行。"""
+    added = []
+    for table, columns in _SCHEMA_UPGRADES.items():
+        existing = {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col in columns:
+            if col not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                added.append(f"{table}.{col}")
+
+    # 老数据兼容：records 有扁平 grade 但缺 stage，按年级前缀回填（无 grade 的错题行保持 NULL）
+    rows = db.execute(
+        "SELECT id, grade FROM records WHERE (stage IS NULL OR stage='') AND grade IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        stage = dict_service.stage_of_grade(row[1])
+        if stage:
+            db.execute("UPDATE records SET stage=? WHERE id=?", (stage, row[0]))
+    return added
+
+
 def init_db():
     db = sqlite3.connect(str(config.DB_PATH))
     db.executescript(
@@ -58,6 +103,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             subject TEXT, grade TEXT,
+            stage TEXT, textbook_version TEXT, region TEXT,
             image_path TEXT, question_text TEXT,
             score TEXT, result_json TEXT,
             created_at TEXT NOT NULL
@@ -66,7 +112,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             record_id INTEGER,
-            subject TEXT, question TEXT, student_answer TEXT,
+            subject TEXT, grade TEXT,
+            stage TEXT, textbook_version TEXT,
+            question TEXT, student_answer TEXT,
             correct_answer TEXT, knowledge_point TEXT,
             error_reason TEXT, analysis TEXT, image_path TEXT,
             mastered INTEGER NOT NULL DEFAULT 0,
@@ -76,6 +124,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_records_user ON records(user_id);
         """
     )
+    _migrate_db(db)
 
     def ensure_user(username, password, role):
         row = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
@@ -157,6 +206,31 @@ def page_app():
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
+    """作业原图访问：必须携带有效登录态（Authorization 头或 ?token= 查询参数）。
+
+    前端 <img> 无法携带自定义请求头，因此同时支持 ?token=；
+    已落库的图片仅本人与管理员可读，避免作业原图被其他账号直接拉取。
+    """
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else (request.args.get("token") or "")
+    payload = None
+    if token:
+        try:
+            payload = jwt.decode(token, config.JWT_SECRET,
+                                 algorithms=[config.JWT_ALGORITHM])
+        except jwt.InvalidTokenError:
+            payload = None
+    if not payload:
+        return fail("未登录，请先登录", 401, 401)
+
+    name = os.path.basename(filename)
+    row = get_db().execute(
+        "SELECT user_id FROM records WHERE image_path=?"
+        " UNION SELECT user_id FROM mistakes WHERE image_path=? LIMIT 1",
+        (name, name),
+    ).fetchone()
+    if row and row["user_id"] != payload["uid"] and payload["role"] != "admin":
+        return fail("无权访问该图片", 403, 403)
     return send_from_directory(str(config.UPLOAD_DIR), filename)
 
 
@@ -185,16 +259,40 @@ def register():
     return ok({"token": make_token(user), "user": public_user(user)}, "注册成功")
 
 
+# 登录失败计数与临时锁定（D-03）：内存态，进程内有效；同账号连续失败 5 次锁 5 分钟
+_LOGIN_LOCK_THRESHOLD = 5
+_LOGIN_LOCK_SECONDS = 300
+_login_attempts = {}  # username -> {"fail": int, "locked_until": float}
+
+
 @app.post("/api/auth/login")
 def login():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
+
+    # 命中锁定则直接拒绝，不查询数据库
+    now = time.monotonic()
+    state = _login_attempts.get(username)
+    if state and state.get("locked_until", 0) > now:
+        remain = int(state["locked_until"] - now)
+        return fail(f"登录尝试过于频繁，请在 {remain} 秒后重试", 429, 429)
+
     row = get_db().execute(
         "SELECT * FROM users WHERE username=?", (username,)
     ).fetchone()
     if not row or not check_password_hash(row["password_hash"], password):
+        # 记录失败；连续失败达到阈值则锁定
+        state = _login_attempts.setdefault(username, {"fail": 0, "locked_until": 0})
+        state["fail"] += 1
+        if state["fail"] >= _LOGIN_LOCK_THRESHOLD:
+            state["locked_until"] = time.monotonic() + _LOGIN_LOCK_SECONDS
+            state["fail"] = 0
+            return fail(f"连续失败次数过多，账号已锁定 {_LOGIN_LOCK_SECONDS // 60} 分钟", 429, 429)
         return fail("用户名或密码错误", http_status=401)
+
+    # 登录成功则清零失败记录
+    _login_attempts.pop(username, None)
     user = dict(row)
     return ok({"token": make_token(user), "user": public_user(user)}, "登录成功")
 
@@ -216,6 +314,59 @@ def re_username(name: str) -> bool:
 
 def public_user(user: dict) -> dict:
     return {"id": user["id"], "username": user["username"], "role": user["role"]}
+
+
+# ========================= 五级级联字典（Epic-09 / T-B01） =========================
+
+@app.get("/api/dict")
+@auth_required
+def api_dict():
+    """五级级联字典：按上级取值返回下级候选。
+
+    无参数                      → 返回地区表、学段表与前端默认值
+    ?stage=初中                 → 返回该学段可选学科
+    ?stage=初中&subject=数学     → 返回该学段可选教材版本
+    ?stage=初中&textbook=人教版  → 返回该学段可选年级（上/下册）
+    ?province=福建省            → 返回该省可选城市
+    """
+    province = request.args.get("province", "").strip()
+    stage = request.args.get("stage", "").strip()
+    subject = request.args.get("subject", "").strip()
+    textbook = request.args.get("textbook", "").strip()
+
+    if province:
+        cities = dict_service.cities_of(province)
+        if cities is None:
+            return fail(f"地区「{province}」不在字典范围内")
+        return ok({"province": province, "cities": cities})
+
+    if not stage:
+        return ok({
+            "regions": dict_service.regions(),
+            "stages": dict_service.stage_list(),
+            "defaults": dict_service.defaults(),
+        })
+
+    stages = dict_service.stage_list()
+    if stages and stage not in stages:
+        return fail(f"学段「{stage}」不在字典范围内")
+
+    subjects = dict_service.subjects_of(stage)
+    textbooks = dict_service.textbooks_of(stage)
+
+    # 已指定教材版本 → 直接返回年级，不要求同时传 subject
+    if textbook:
+        if textbooks and textbook not in textbooks:
+            return fail(f"「{stage}」不含教材版本「{textbook}」")
+        return ok({"stage": stage, "subject": subject, "textbook": textbook,
+                   "grades": dict_service.grades_of(stage)})
+
+    if not subject:
+        return ok({"stage": stage, "subjects": subjects})
+    if subjects and subject not in subjects:
+        return fail(f"「{stage}」不含学科「{subject}」")
+
+    return ok({"stage": stage, "subject": subject, "textbooks": textbooks})
 
 
 # ========================= 作业批改主链路（Epic-01/02/03/04） =========================
@@ -257,10 +408,11 @@ def homework_grade():
     data = request.get_json(silent=True) or {}
     subject = (data.get("subject") or "综合").strip()
     grade = (data.get("grade") or "").strip()
-    # T-B05：学段 / 教材版本（五级级联需求的中期修改），用于 RAG 标签过滤；
-    # 未传时降级为原有全库检索行为，保持向后兼容
+    # T-B02 / T-B05：五级参数（学段 / 教材版本 / 地区）
+    # 前端提交字段为 textbook_version，同时兼容 textbook 别名
     stage = (data.get("stage") or "").strip()
-    textbook_version = (data.get("textbook_version") or "").strip()
+    textbook_version = (data.get("textbook_version") or data.get("textbook") or "").strip()
+    region = (data.get("region") or "").strip()
     question_text = (data.get("question_text") or "").strip()
     image_name = data.get("image_name")
     if image_name:
@@ -269,6 +421,12 @@ def homework_grade():
             image_name = None
     if not question_text:
         return fail("作业题目内容为空，请识别或手动录入后再提交")
+
+    # 五级字典校验：字典外的学段/学科/教材版本/年级/地区一律拒绝，不静默入库
+    valid, msg = dict_service.validate_selection(stage, subject, textbook_version,
+                                                 grade, region)
+    if not valid:
+        return fail(msg)
 
     # RAG 召回（按学段 / 教材版本过滤，避免跨学段资料串库）
     contexts = rag_engine.search(
@@ -279,18 +437,25 @@ def homework_grade():
 
     # AI 批改
     try:
-        result = llm_service.grade_homework(subject, grade, question_text, contexts)
+        result = llm_service.grade_homework(
+            subject, grade, question_text, contexts,
+            stage=stage, textbook_version=textbook_version, region=region,
+        )
     except llm_service.LLMError as exc:
         return fail(str(exc))
     except Exception:
+        # D-11：异常必须落日志，避免线上问题无法定位
+        logger.exception("批改服务异常 user_id=%s subject=%s", g.user["id"], subject)
         return fail("批改服务暂时不可用，请稍后重试")
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = get_db()
     cur = db.execute(
-        "INSERT INTO records (user_id, subject, grade, image_path, question_text,"
-        " score, result_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (g.user["id"], subject, grade, image_name, question_text,
+        "INSERT INTO records (user_id, subject, grade, stage, textbook_version, region,"
+        " image_path, question_text, score, result_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (g.user["id"], subject, grade, stage, textbook_version, region,
+         image_name, question_text,
          str(result.get("score") or ""), json.dumps(result, ensure_ascii=False), now),
     )
     record_id = cur.lastrowid
@@ -300,11 +465,11 @@ def homework_grade():
     for q in result.get("questions", []):
         if q.get("is_correct") is False:
             db.execute(
-                "INSERT INTO mistakes (user_id, record_id, subject, question,"
-                " student_answer, correct_answer, knowledge_point, error_reason,"
-                " analysis, image_path, mastered, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,0,?)",
-                (g.user["id"], record_id, subject,
+                "INSERT INTO mistakes (user_id, record_id, subject, grade, stage,"
+                " textbook_version, question, student_answer, correct_answer,"
+                " knowledge_point, error_reason, analysis, image_path, mastered, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
+                (g.user["id"], record_id, subject, grade, stage, textbook_version,
                  q.get("question"), q.get("student_answer"),
                  q.get("correct_answer"), q.get("knowledge_point"),
                  q.get("error_reason"), q.get("analysis"), image_name, now),
@@ -323,20 +488,60 @@ def homework_grade():
 
 # ========================= 批改记录 & 错题本（Epic-05） =========================
 
+def _parse_pagination():
+    """解析分页参数 page / page_size（D-08）。
+
+    两者均未传时返回 (None, None)，保持旧版"全量返回"行为不变；
+    一旦传入分页参数，page 默认 1、page_size 默认 20、上限 100，返回分页结构。
+    """
+    page_raw = request.args.get("page")
+    size_raw = request.args.get("page_size")
+    if page_raw is None and size_raw is None:
+        return None, None
+    try:
+        page = max(int(page_raw or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(size_raw or 20)
+    except (TypeError, ValueError):
+        size = 20
+    size = min(max(size, 1), 100)
+    return page, size
+
+
 @app.get("/api/records")
 @auth_required
 def list_records():
-    rows = get_db().execute(
-        "SELECT id, subject, grade, image_path, score, created_at FROM records"
-        " WHERE user_id=? ORDER BY id DESC LIMIT 50",
-        (g.user["id"],),
-    ).fetchall()
+    page, page_size = _parse_pagination()
+    db = get_db()
+    if page is not None:
+        total = db.execute(
+            "SELECT COUNT(*) FROM records WHERE user_id=?", (g.user["id"],)
+        ).fetchone()[0]
+        rows = db.execute(
+            "SELECT id, subject, grade, stage, textbook_version, region, image_path,"
+            " score, created_at FROM records WHERE user_id=?"
+            " ORDER BY id DESC LIMIT ? OFFSET ?",
+            (g.user["id"], page_size, (page - 1) * page_size),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, subject, grade, stage, textbook_version, region, image_path,"
+            " score, created_at FROM records"
+            " WHERE user_id=? ORDER BY id DESC LIMIT 50",
+            (g.user["id"],),
+        ).fetchall()
+
     items = []
     for r in rows:
         item = dict(r)
         if item.get("image_path"):
             item["image_url"] = f"/uploads/{item['image_path']}"
         items.append(item)
+
+    if page is not None:
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     return ok(items)
 
 
@@ -344,30 +549,63 @@ def list_records():
 @auth_required
 def list_mistakes():
     subject = request.args.get("subject", "").strip()
+    stage = request.args.get("stage", "").strip()
+    # 前端提交字段为 textbook_version，同时兼容 textbook 别名
+    textbook = (request.args.get("textbook_version")
+                or request.args.get("textbook") or "").strip()
+    grade = request.args.get("grade", "").strip()
     keyword = request.args.get("keyword", "").strip()
     mastered = request.args.get("mastered", "").strip()
+    page, page_size = _parse_pagination()
 
-    sql = ("SELECT id, subject, question, student_answer, correct_answer,"
-           " knowledge_point, error_reason, analysis, image_path, mastered,"
-           " created_at FROM mistakes WHERE user_id=?")
+    where = " WHERE user_id=?"
     params = [g.user["id"]]
     if subject:
-        sql += " AND subject=?"
+        where += " AND subject=?"
         params.append(subject)
+    if stage:
+        where += " AND stage=?"
+        params.append(stage)
+    if textbook:
+        where += " AND textbook_version=?"
+        params.append(textbook)
+    if grade:
+        where += " AND grade=?"
+        params.append(grade)
     if mastered in ("0", "1"):
-        sql += " AND mastered=?"
+        where += " AND mastered=?"
         params.append(int(mastered))
     if keyword:
-        sql += " AND (question LIKE ? OR knowledge_point LIKE ?)"
+        where += " AND (question LIKE ? OR knowledge_point LIKE ?)"
         params.extend([f"%{keyword}%", f"%{keyword}%"])
-    sql += " ORDER BY id DESC LIMIT 200"
+
+    db = get_db()
+    total = None
+    if page is not None:
+        total = db.execute("SELECT COUNT(*) FROM mistakes" + where, params).fetchone()[0]
+
+    select = ("SELECT id, subject, grade, stage, textbook_version, question,"
+              " student_answer, correct_answer, knowledge_point, error_reason,"
+              " analysis, image_path, mastered, created_at FROM mistakes")
+    if page is not None:
+        rows = db.execute(
+            select + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, (page - 1) * page_size],
+        ).fetchall()
+    else:
+        rows = db.execute(
+            select + where + " ORDER BY id DESC LIMIT 200", params
+        ).fetchall()
 
     items = []
-    for r in get_db().execute(sql, params).fetchall():
+    for r in rows:
         item = dict(r)
         if item.get("image_path"):
             item["image_url"] = f"/uploads/{item['image_path']}"
         items.append(item)
+
+    if page is not None:
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     return ok(items)
 
 
@@ -541,6 +779,7 @@ def get_settings():
         "deepseek_base_url": s.get("deepseek_base_url"),
         "deepseek_model": s.get("deepseek_model"),
         "chunk_size": s.get("chunk_size"),
+        "chunk_overlap": s.get("chunk_overlap"),
         "top_k": s.get("top_k"),
         "min_score": s.get("min_score"),
     })
@@ -557,12 +796,54 @@ def update_settings():
         patch["deepseek_base_url"] = data["deepseek_base_url"].strip()
     if data.get("deepseek_model"):
         patch["deepseek_model"] = data["deepseek_model"].strip()
-    for key in ("chunk_size", "top_k", "min_score"):
-        if data.get(key) is not None:
-            try:
-                patch[key] = float(data[key]) if key == "min_score" else int(data[key])
-            except (TypeError, ValueError):
-                return fail(f"参数 {key} 格式不正确")
+
+    # D-01：数值型参数做范围校验，非法值拒绝并给出可读提示，避免切片步长退化为 1 或检索恒空
+    def _int(key, lo, hi):
+        raw = data.get(key)
+        if raw is None:
+            return None
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"参数 {key} 必须是整数")
+        if not (lo <= val <= hi):
+            raise ValueError(f"参数 {key} 需在 [{lo}, {hi}] 范围内")
+        return val
+
+    def _float(key, lo, hi):
+        raw = data.get(key)
+        if raw is None:
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"参数 {key} 必须是数字")
+        if not (lo <= val <= hi):
+            raise ValueError(f"参数 {key} 需在 [{lo}, {hi}] 范围内")
+        return val
+
+    try:
+        chunk_size = _int("chunk_size", 50, 2000)
+        chunk_overlap = _int("chunk_overlap", 0, 2000)
+        top_k = _int("top_k", 1, 20)
+        min_score = _float("min_score", 0.0, 1.0)
+    except ValueError as exc:
+        return fail(str(exc))
+
+    if chunk_size is not None:
+        patch["chunk_size"] = chunk_size
+    if chunk_overlap is not None:
+        effective_size = chunk_size if chunk_size is not None else int(
+            config.load_settings().get("chunk_size", 500)
+        )
+        if chunk_overlap >= effective_size:
+            return fail(f"chunk_overlap 必须小于 chunk_size（当前 chunk_size={effective_size}）")
+        patch["chunk_overlap"] = chunk_overlap
+    if top_k is not None:
+        patch["top_k"] = top_k
+    if min_score is not None:
+        patch["min_score"] = min_score
+
     config.save_settings(patch)
     return ok(msg="设置已保存")
 

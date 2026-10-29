@@ -90,7 +90,8 @@ class TestE2EGradingAndMistakes:
         # 1) mock LLM grade_homework，直接返回 MOCK_GRADE_RESPONSE
         import llm_service as llm_mod
 
-        def fake_grade(subject, grade, homework_text, contexts):
+        def fake_grade(subject, grade, homework_text, contexts, **scope):
+            # **scope 接收 stage / textbook_version / region（T-B04 后签名扩展）
             return json.loads(json.dumps(self.MOCK_GRADE_RESPONSE))
 
         monkeypatch.setattr(llm_mod, "grade_homework", fake_grade)
@@ -186,6 +187,45 @@ class TestE2EGradingAndMistakes:
         bob_r = j(client.get("/api/records", headers=bob_headers))["data"]
         assert len(bob_m) == 2
         assert len(bob_r) == 1
+
+
+# =====================================================================
+# D-07：Schema 校验在 E2E 主链路中真实执行
+# =====================================================================
+class TestE2ESchemaValidationInPipeline:
+    """只 mock _post_chat，让 _extract_json + _validate_result 真实运行，而非整段绕过。"""
+
+    @pytest.mark.e2e
+    def test_bad_question_dropped_and_warning_exposed(self, client, student_headers,
+                                                      request, monkeypatch, sample_math_txt):
+        import llm_service as llm_mod
+
+        raw = json.dumps({
+            "score": "50",
+            "overall_comment": "测试评语",
+            "questions": [
+                {"question": "合法错题", "student_answer": "1", "is_correct": False,
+                 "score": "0", "correct_answer": "2", "knowledge_point": "加法",
+                 "analysis": "解析"},
+                # 缺 is_correct → 应被 _validate_result 丢弃
+                {"question": "非法题", "student_answer": "1"},
+            ],
+        }, ensure_ascii=False)
+        monkeypatch.setattr(llm_mod, "_post_chat", lambda *a, **k: raw)
+
+        client.post("/api/knowledge/scan", headers=request.getfixturevalue("admin_headers"))
+
+        resp = client.post("/api/homework/grade", headers=student_headers,
+                           json={"subject": "数学", "grade": "小学五年级",
+                                 "question_text": "1. 25 - 8 + 3 = 14"})
+        body = j(resp)
+        assert resp.status_code == 200 and body["code"] == 0, body.get("msg")
+
+        result = body["data"]["result"]
+        assert len(result["questions"]) == 1
+        assert result["questions"][0]["question"] == "合法错题"
+        assert result.get("warnings"), "应透出校验告警"
+        assert body["data"]["wrong_count"] == 1
 
 
 # =====================================================================
