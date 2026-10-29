@@ -371,7 +371,10 @@ def homework_grade():
 
     # AI 批改
     try:
-        result = llm_service.grade_homework(subject, grade, question_text, contexts)
+        result = llm_service.grade_homework(
+            subject, grade, question_text, contexts,
+            stage=stage, textbook_version=textbook_version, region=region,
+        )
     except llm_service.LLMError as exc:
         return fail(str(exc))
     except Exception:

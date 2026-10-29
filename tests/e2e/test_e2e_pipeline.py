@@ -90,7 +90,8 @@ class TestE2EGradingAndMistakes:
         # 1) mock LLM grade_homework，直接返回 MOCK_GRADE_RESPONSE
         import llm_service as llm_mod
 
-        def fake_grade(subject, grade, homework_text, contexts):
+        def fake_grade(subject, grade, homework_text, contexts, **scope):
+            # **scope 接收 stage / textbook_version / region（T-B04 后签名扩展）
             return json.loads(json.dumps(self.MOCK_GRADE_RESPONSE))
 
         monkeypatch.setattr(llm_mod, "grade_homework", fake_grade)

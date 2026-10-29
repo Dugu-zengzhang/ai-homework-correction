@@ -22,7 +22,7 @@ SYSTEM_PROMPT = (
     "你的讲解语言要通俗易懂，符合中小学生认知水平，多鼓励、少批评。"
 )
 
-GRADE_PROMPT_TEMPLATE = """请批改以下{grade}{subject}作业。
+GRADE_PROMPT_TEMPLATE = """请批改以下{grade}{subject}作业。{scope}
 
 【学生作业内容】（由图片 OCR 识别得到，可能包含一道或多道题目及学生作答，也可能存在识别误差）
 {homework}
@@ -116,8 +116,113 @@ def _extract_json(raw: str) -> dict:
         raise
 
 
-def grade_homework(subject: str, grade: str, homework_text: str, contexts: list) -> dict:
-    """完整批改：组装 RAG 上下文 → 调用大模型 → 解析结构化结果。"""
+def _is_score_valid(value) -> bool:
+    """得分允许 null、空串、数值，或可转数值的字符串（如 "85"）。"""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return True
+        try:
+            float(text)
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _validate_result(result) -> tuple:
+    """按约定 Schema 校验并清洗大模型输出，返回 (cleaned, warnings)。
+
+    处理策略：**单题丢弃并记录**（T-C01）——单题字段缺失或类型非法时只丢弃该题，
+    不影响整次批改；总分 / 总评格式非法则置空并记录。这样既不让脏数据写入错题本，
+    也不会因为一道题格式异常就让整份作业批改失败。
+    """
+    warnings = []
+    if not isinstance(result, dict):
+        return ({"score": None, "overall_comment": "", "questions": []},
+                ["模型输出不是 JSON 对象，已降级为空结果"])
+
+    cleaned = dict(result)
+    cleaned.setdefault("score", None)
+    cleaned.setdefault("overall_comment", "")
+
+    if not _is_score_valid(cleaned.get("score")):
+        warnings.append(f"总分格式非法（{cleaned.get('score')!r}），已置空")
+        cleaned["score"] = None
+
+    if cleaned.get("overall_comment") is None:
+        cleaned["overall_comment"] = ""
+    elif not isinstance(cleaned.get("overall_comment"), str):
+        warnings.append("总评格式非法，已置空")
+        cleaned["overall_comment"] = ""
+
+    raw_questions = cleaned.get("questions")
+    if raw_questions is None:
+        raw_questions = []
+    if not isinstance(raw_questions, list):
+        warnings.append("questions 不是数组，已置空")
+        cleaned["questions"] = []
+        return cleaned, warnings
+
+    kept = []
+    for idx, item in enumerate(raw_questions, 1):
+        if not isinstance(item, dict):
+            warnings.append(f"第 {idx} 题不是对象，已丢弃")
+            continue
+        if not str(item.get("question") or "").strip():
+            warnings.append(f"第 {idx} 题缺少必填字段 question，已丢弃")
+            continue
+        if "is_correct" not in item:
+            warnings.append(f"第 {idx} 题缺少必填字段 is_correct，已丢弃")
+            continue
+        value = item.get("is_correct")
+        # 严格类型校验：不接受 1/0、"true" 等真值近似写法
+        if not (isinstance(value, bool) or value is None):
+            warnings.append(f"第 {idx} 题 is_correct 类型非法（{value!r}），已丢弃")
+            continue
+        if not _is_score_valid(item.get("score")):
+            warnings.append(f"第 {idx} 题得分格式非法，已置空")
+            item["score"] = None
+        kept.append(item)
+
+    cleaned["questions"] = kept
+    return cleaned, warnings
+
+
+def _build_scope(stage: str, textbook_version: str, region: str) -> str:
+    """把学段 / 教材版本 / 地区组装成提示词里的「学情范围」段。
+
+    三者全空时返回空串，保持与旧版提示词完全一致的兜底行为。
+    """
+    parts = []
+    if stage:
+        parts.append(f"学段：{stage}")
+    if textbook_version:
+        parts.append(f"教材版本：{textbook_version}")
+    if region:
+        parts.append(f"地区：{region}")
+    if not parts:
+        return ""
+    return (
+        "\n【学情范围】" + "；".join(parts)
+        + "。请按该教材版本的知识体系、章节顺序与教学要求判断对错并组织解析。"
+    )
+
+
+def grade_homework(subject: str, grade: str, homework_text: str, contexts: list,
+                   stage: str = "", textbook_version: str = "",
+                   region: str = "") -> dict:
+    """完整批改：组装 RAG 上下文 → 调用大模型 → 解析并校验结构化结果。
+
+    stage / textbook_version / region 用于把「学段 / 教材版本 / 地区」注入提示词，
+    使判题口径对齐教材（T-B04）；三者均未传时保持原有行为不变。
+    """
     homework_text = (homework_text or "").strip()
     if not homework_text:
         raise LLMError("作业内容为空，请先上传图片识别或手动录入题目。")
@@ -136,6 +241,7 @@ def grade_homework(subject: str, grade: str, homework_text: str, contexts: list)
     prompt = GRADE_PROMPT_TEMPLATE.format(
         grade=grade or "中小学",
         subject=subject or "综合",
+        scope=_build_scope(stage, textbook_version, region),
         homework=homework_text,
         context=context_text,
     )
@@ -157,9 +263,10 @@ def grade_homework(subject: str, grade: str, homework_text: str, contexts: list)
         raw = _post_chat(messages)
         result = _extract_json(raw)
 
-    result.setdefault("questions", [])
-    result.setdefault("overall_comment", "")
-    result.setdefault("score", None)
+    result, warnings = _validate_result(result)
+    if warnings:
+        # 透出校验告警，便于前端提示与问题回溯；无异常时不改变原有返回结构
+        result["warnings"] = warnings
     return result
 
 
