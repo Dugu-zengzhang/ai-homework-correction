@@ -19,6 +19,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
 import config
+import dict_service
 import llm_service
 import ocr_service
 from rag_engine import rag_engine
@@ -43,6 +44,34 @@ def close_db(_exc):
         db.close()
 
 
+# 表结构升级计划：旧库补齐新增列（幂等，可重复执行）
+_SCHEMA_UPGRADES = {
+    "records": ["stage", "textbook_version", "region"],
+    "mistakes": ["grade", "stage", "textbook_version"],
+}
+
+
+def _migrate_db(db):
+    """为已存在的旧库补齐新增字段，并回填可推断的学段；幂等，可重复执行。"""
+    added = []
+    for table, columns in _SCHEMA_UPGRADES.items():
+        existing = {r[1] for r in db.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col in columns:
+            if col not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                added.append(f"{table}.{col}")
+
+    # 老数据兼容：records 有扁平 grade 但缺 stage，按年级前缀回填（无 grade 的错题行保持 NULL）
+    rows = db.execute(
+        "SELECT id, grade FROM records WHERE (stage IS NULL OR stage='') AND grade IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        stage = dict_service.stage_of_grade(row[1])
+        if stage:
+            db.execute("UPDATE records SET stage=? WHERE id=?", (stage, row[0]))
+    return added
+
+
 def init_db():
     db = sqlite3.connect(str(config.DB_PATH))
     db.executescript(
@@ -58,6 +87,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             subject TEXT, grade TEXT,
+            stage TEXT, textbook_version TEXT, region TEXT,
             image_path TEXT, question_text TEXT,
             score TEXT, result_json TEXT,
             created_at TEXT NOT NULL
@@ -66,7 +96,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             record_id INTEGER,
-            subject TEXT, question TEXT, student_answer TEXT,
+            subject TEXT, grade TEXT,
+            stage TEXT, textbook_version TEXT,
+            question TEXT, student_answer TEXT,
             correct_answer TEXT, knowledge_point TEXT,
             error_reason TEXT, analysis TEXT, image_path TEXT,
             mastered INTEGER NOT NULL DEFAULT 0,
@@ -76,6 +108,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_records_user ON records(user_id);
         """
     )
+    _migrate_db(db)
 
     def ensure_user(username, password, role):
         row = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
@@ -218,6 +251,59 @@ def public_user(user: dict) -> dict:
     return {"id": user["id"], "username": user["username"], "role": user["role"]}
 
 
+# ========================= 五级级联字典（Epic-09 / T-B01） =========================
+
+@app.get("/api/dict")
+@auth_required
+def api_dict():
+    """五级级联字典：按上级取值返回下级候选。
+
+    无参数                      → 返回地区表、学段表与前端默认值
+    ?stage=初中                 → 返回该学段可选学科
+    ?stage=初中&subject=数学     → 返回该学段可选教材版本
+    ?stage=初中&textbook=人教版  → 返回该学段可选年级（上/下册）
+    ?province=福建省            → 返回该省可选城市
+    """
+    province = request.args.get("province", "").strip()
+    stage = request.args.get("stage", "").strip()
+    subject = request.args.get("subject", "").strip()
+    textbook = request.args.get("textbook", "").strip()
+
+    if province:
+        cities = dict_service.cities_of(province)
+        if cities is None:
+            return fail(f"地区「{province}」不在字典范围内")
+        return ok({"province": province, "cities": cities})
+
+    if not stage:
+        return ok({
+            "regions": dict_service.regions(),
+            "stages": dict_service.stage_list(),
+            "defaults": dict_service.defaults(),
+        })
+
+    stages = dict_service.stage_list()
+    if stages and stage not in stages:
+        return fail(f"学段「{stage}」不在字典范围内")
+
+    subjects = dict_service.subjects_of(stage)
+    textbooks = dict_service.textbooks_of(stage)
+
+    # 已指定教材版本 → 直接返回年级，不要求同时传 subject
+    if textbook:
+        if textbooks and textbook not in textbooks:
+            return fail(f"「{stage}」不含教材版本「{textbook}」")
+        return ok({"stage": stage, "subject": subject, "textbook": textbook,
+                   "grades": dict_service.grades_of(stage)})
+
+    if not subject:
+        return ok({"stage": stage, "subjects": subjects})
+    if subjects and subject not in subjects:
+        return fail(f"「{stage}」不含学科「{subject}」")
+
+    return ok({"stage": stage, "subject": subject, "textbooks": textbooks})
+
+
 # ========================= 作业批改主链路（Epic-01/02/03/04） =========================
 
 @app.post("/api/homework/upload")
@@ -257,10 +343,11 @@ def homework_grade():
     data = request.get_json(silent=True) or {}
     subject = (data.get("subject") or "综合").strip()
     grade = (data.get("grade") or "").strip()
-    # T-B05：学段 / 教材版本（五级级联需求的中期修改），用于 RAG 标签过滤；
-    # 未传时降级为原有全库检索行为，保持向后兼容
+    # T-B02 / T-B05：五级参数（学段 / 教材版本 / 地区）
+    # 前端提交字段为 textbook_version，同时兼容 textbook 别名
     stage = (data.get("stage") or "").strip()
-    textbook_version = (data.get("textbook_version") or "").strip()
+    textbook_version = (data.get("textbook_version") or data.get("textbook") or "").strip()
+    region = (data.get("region") or "").strip()
     question_text = (data.get("question_text") or "").strip()
     image_name = data.get("image_name")
     if image_name:
@@ -269,6 +356,11 @@ def homework_grade():
             image_name = None
     if not question_text:
         return fail("作业题目内容为空，请识别或手动录入后再提交")
+
+    # 五级字典校验：字典外的学段/学科/教材版本/年级一律拒绝，不静默入库
+    valid, msg = dict_service.validate_selection(stage, subject, textbook_version, grade)
+    if not valid:
+        return fail(msg)
 
     # RAG 召回（按学段 / 教材版本过滤，避免跨学段资料串库）
     contexts = rag_engine.search(
@@ -288,9 +380,11 @@ def homework_grade():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db = get_db()
     cur = db.execute(
-        "INSERT INTO records (user_id, subject, grade, image_path, question_text,"
-        " score, result_json, created_at) VALUES (?,?,?,?,?,?,?,?)",
-        (g.user["id"], subject, grade, image_name, question_text,
+        "INSERT INTO records (user_id, subject, grade, stage, textbook_version, region,"
+        " image_path, question_text, score, result_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (g.user["id"], subject, grade, stage, textbook_version, region,
+         image_name, question_text,
          str(result.get("score") or ""), json.dumps(result, ensure_ascii=False), now),
     )
     record_id = cur.lastrowid
@@ -300,11 +394,11 @@ def homework_grade():
     for q in result.get("questions", []):
         if q.get("is_correct") is False:
             db.execute(
-                "INSERT INTO mistakes (user_id, record_id, subject, question,"
-                " student_answer, correct_answer, knowledge_point, error_reason,"
-                " analysis, image_path, mastered, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,0,?)",
-                (g.user["id"], record_id, subject,
+                "INSERT INTO mistakes (user_id, record_id, subject, grade, stage,"
+                " textbook_version, question, student_answer, correct_answer,"
+                " knowledge_point, error_reason, analysis, image_path, mastered, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
+                (g.user["id"], record_id, subject, grade, stage, textbook_version,
                  q.get("question"), q.get("student_answer"),
                  q.get("correct_answer"), q.get("knowledge_point"),
                  q.get("error_reason"), q.get("analysis"), image_name, now),
@@ -327,7 +421,8 @@ def homework_grade():
 @auth_required
 def list_records():
     rows = get_db().execute(
-        "SELECT id, subject, grade, image_path, score, created_at FROM records"
+        "SELECT id, subject, grade, stage, textbook_version, region, image_path,"
+        " score, created_at FROM records"
         " WHERE user_id=? ORDER BY id DESC LIMIT 50",
         (g.user["id"],),
     ).fetchall()
@@ -344,16 +439,29 @@ def list_records():
 @auth_required
 def list_mistakes():
     subject = request.args.get("subject", "").strip()
+    stage = request.args.get("stage", "").strip()
+    textbook = request.args.get("textbook", "").strip()
+    grade = request.args.get("grade", "").strip()
     keyword = request.args.get("keyword", "").strip()
     mastered = request.args.get("mastered", "").strip()
 
-    sql = ("SELECT id, subject, question, student_answer, correct_answer,"
-           " knowledge_point, error_reason, analysis, image_path, mastered,"
-           " created_at FROM mistakes WHERE user_id=?")
+    sql = ("SELECT id, subject, grade, stage, textbook_version, question,"
+           " student_answer, correct_answer, knowledge_point, error_reason,"
+           " analysis, image_path, mastered, created_at"
+           " FROM mistakes WHERE user_id=?")
     params = [g.user["id"]]
     if subject:
         sql += " AND subject=?"
         params.append(subject)
+    if stage:
+        sql += " AND stage=?"
+        params.append(stage)
+    if textbook:
+        sql += " AND textbook_version=?"
+        params.append(textbook)
+    if grade:
+        sql += " AND grade=?"
+        params.append(grade)
     if mastered in ("0", "1"):
         sql += " AND mastered=?"
         params.append(int(mastered))

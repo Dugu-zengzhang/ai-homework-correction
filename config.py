@@ -15,6 +15,8 @@ DB_PATH = DATA_DIR / "app.db"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 INDEX_PATH = DATA_DIR / "rag_index.json"
 SECRET_PATH = DATA_DIR / ".secret_key"
+# 五级级联字典（地区/学段/学科/教材版本/年级）：静态文件，随代码进仓库
+DICT_PATH = DATA_DIR / "dict.json"
 # 专门存放 DeepSeek API Key 的文本文件（项目根目录）
 API_KEY_PATH = BASE_DIR / "api_key.txt"
 

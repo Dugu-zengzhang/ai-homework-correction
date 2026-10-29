@@ -61,6 +61,7 @@ def init_tmp_db(tmp_db_path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             subject TEXT, grade TEXT,
+            stage TEXT, textbook_version TEXT, region TEXT,
             image_path TEXT, question_text TEXT,
             score TEXT, result_json TEXT,
             created_at TEXT NOT NULL
@@ -69,7 +70,9 @@ def init_tmp_db(tmp_db_path):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             record_id INTEGER,
-            subject TEXT, question TEXT, student_answer TEXT,
+            subject TEXT, grade TEXT,
+            stage TEXT, textbook_version TEXT,
+            question TEXT, student_answer TEXT,
             correct_answer TEXT, knowledge_point TEXT,
             error_reason TEXT, analysis TEXT, image_path TEXT,
             mastered INTEGER NOT NULL DEFAULT 0,
