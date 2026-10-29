@@ -6,7 +6,6 @@
 - 结构化解析输出（对错、得分、错误原因、知识点、参考答案、解析）。
 """
 import json
-import re
 
 import requests
 
@@ -107,13 +106,41 @@ def _post_chat(messages: dict, timeout: int = 60):
 
 
 def _extract_json(raw: str) -> dict:
+    if not isinstance(raw, str):
+        raw = str(raw)
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.S)
-        if match:
-            return json.loads(match.group(0))
-        raise
+        pass
+
+    # D-10：从混杂文本中提取第一个完整的 JSON 对象。
+    # 用括号配对而非贪婪正则可正确处理字符串内部的 '{'/'}' 与多段 JSON 场景。
+    start = raw.find("{")
+    if start == -1:
+        raise ValueError("大模型输出中未找到 JSON 对象")
+
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(raw[start:i + 1])
+    raise ValueError("大模型输出中的 JSON 括号不配对")
 
 
 def _is_score_valid(value) -> bool:

@@ -64,6 +64,33 @@ class TestOCRTextClean:
         assert result["engine"] == "manual"
         assert len(result["text"]) == 0
 
+    @pytest.mark.unit
+    @pytest.mark.require_ocr
+    def test_ocr_real_image_recognizes_text(self, tmp_path):
+        """D-04：真实 OCR 用例——用内置样例图断言确实识别出文字，无引擎则 skip 而非伪装通过。"""
+        pytesseract = pytest.importorskip("pytesseract")
+        from PIL import Image, ImageDraw, ImageFont
+
+        try:
+            pytesseract.get_tesseract_version()
+        except Exception:
+            pytest.skip("未安装 Tesseract 引擎")
+
+        img = Image.new("RGB", (640, 160), "white")
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype("arial.ttf", 48)
+        except Exception:
+            font = ImageFont.load_default()
+        draw.text((20, 50), "25 - 8 + 3 = 20", fill="black", font=font)
+        p = tmp_path / "sample_math.png"
+        img.save(str(p))
+
+        from ocr_service import ocr_image
+        result = ocr_image(str(p))
+        assert result["engine"] == "tesseract"
+        assert result["text"].strip()
+
 
 # =====================================================================
 # RAG 模块 —— rag_engine.py：文档解析 / 切片 / 分词 / TF-IDF
@@ -302,6 +329,29 @@ class TestLLMPureLogic:
         from llm_service import _extract_json
         with pytest.raises(Exception):
             _extract_json("这根本不是一个 json 啊 12345")
+
+    @pytest.mark.unit
+    def test_extract_json_multiple_objects_takes_first(self):
+        """D-10：多段 JSON 混排时，括号配对只取第一个完整对象，不被贪婪正则吞到第二个。"""
+        from llm_service import _extract_json
+        raw = '{"score":"90"}{"score":"80"}'
+        data = _extract_json(raw)
+        assert data["score"] == "90"
+
+    @pytest.mark.unit
+    def test_extract_json_brace_inside_string(self):
+        """D-10：字符串值内部含 '{'/'}' 时，括号配对不能提前截断。"""
+        from llm_service import _extract_json
+        raw = '前置文字 {"analysis": "集合 {1,2,3} 与 {4,5} 的交集"} 后续'
+        data = _extract_json(raw)
+        assert data["analysis"] == "集合 {1,2,3} 与 {4,5} 的交集"
+
+    @pytest.mark.unit
+    def test_extract_json_unbalanced_raises(self):
+        """D-10：括号不配对时抛异常，而非返回被截断的半截 JSON。"""
+        from llm_service import _extract_json
+        with pytest.raises(Exception):
+            _extract_json('{"score": "90"')
 
     @pytest.mark.unit
     def test_grade_homework_raises_on_empty_text(self):

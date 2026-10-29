@@ -20,25 +20,44 @@ def clean_ocr_text(text: str) -> str:
 
 
 def ocr_image(image_path: str) -> dict:
-    """返回 {text, engine, note}。"""
+    """返回 {text, engine, note}。
+
+    D-06：区分「缺依赖」「缺引擎」「识别失败」三种情况，note 给出可读原因，
+    不再笼统吞掉异常。engine 取值：tesseract / manual。
+    """
     try:
         import pytesseract  # type: ignore
         from PIL import Image  # type: ignore
-
-        text = pytesseract.image_to_string(
-            Image.open(image_path), lang="chi_sim+eng"
-        )
-        text = clean_ocr_text(text)
-        if text:
-            return {"text": text, "engine": "tesseract", "note": ""}
-        return {
-            "text": "",
-            "engine": "tesseract",
-            "note": "未从图片中识别到文字，请手动录入题目内容。",
-        }
-    except Exception:
+    except ImportError as exc:
+        missing = getattr(exc, "name", "pytesseract/Pillow")
         return {
             "text": "",
             "engine": "manual",
-            "note": "当前未启用自动 OCR，请将作业题目文字录入/粘贴到下方文本框（支持修改后再批改）。",
+            "note": f"未启用自动 OCR（缺少依赖 {missing}），请手动录入题目，或执行 pip install -r requirements-ocr.txt。",
         }
+
+    try:
+        text = pytesseract.image_to_string(
+            Image.open(image_path), lang="chi_sim+eng"
+        )
+    except pytesseract.TesseractNotFoundError:
+        return {
+            "text": "",
+            "engine": "manual",
+            "note": "未检测到 Tesseract 引擎，请手动录入题目；或安装引擎并配置 chi_sim 中文语言包后重试。",
+        }
+    except Exception as exc:  # noqa: BLE001 —— 识别失败需转成可读提示
+        return {
+            "text": "",
+            "engine": "manual",
+            "note": f"OCR 识别失败（{exc}），请手动录入题目内容。",
+        }
+
+    text = clean_ocr_text(text)
+    if text:
+        return {"text": text, "engine": "tesseract", "note": ""}
+    return {
+        "text": "",
+        "engine": "tesseract",
+        "note": "未从图片中识别到文字，请手动录入题目内容。",
+    }
