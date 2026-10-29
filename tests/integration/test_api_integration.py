@@ -82,6 +82,23 @@ class TestAuth:
         assert resp.status_code == 401
         assert j(resp)["code"] != 0
 
+    @pytest.mark.integration
+    def test_login_locked_after_repeated_failures(self, client, monkeypatch):
+        """D-03：同账号连续失败 5 次触发临时锁定，锁定期间即使密码正确也拒绝。"""
+        import app as app_module
+        monkeypatch.setattr(app_module, "_login_attempts", {})
+        client.post("/api/auth/register", json={"username": "lockme", "password": "123456"})
+
+        for _ in range(4):
+            r = client.post("/api/auth/login", json={"username": "lockme", "password": "bad"})
+            assert r.status_code == 401
+
+        r = client.post("/api/auth/login", json={"username": "lockme", "password": "bad"})
+        assert r.status_code == 429, "第 5 次失败应锁定"
+
+        r = client.post("/api/auth/login", json={"username": "lockme", "password": "123456"})
+        assert r.status_code == 429, "锁定期间正确密码也应被拒"
+
     # --- AUTH-07 未登录访问业务接口 ---
     @pytest.mark.integration
     def test_access_mistakes_without_token_is_401(self, client):
@@ -238,6 +255,33 @@ class TestHomeworkGradeAPI:
         assert data["code"] != 0
         assert "地区" in data.get("msg", "")
 
+    @pytest.mark.integration
+    def test_grade_internal_error_logged(self, client, student_headers, monkeypatch):
+        """D-11：批改接口内部异常必须落日志，且仍返回统一错误文案。"""
+        import llm_service as llm_mod
+        import app as app_module
+
+        def boom(*_a, **_k):
+            raise RuntimeError("模拟内部异常")
+
+        monkeypatch.setattr(llm_mod, "grade_homework", boom)
+
+        logged = []
+
+        class _FakeLogger:
+            def exception(self, *a, **k):
+                logged.append((a, k))
+
+        monkeypatch.setattr(app_module, "logger", _FakeLogger())
+
+        resp = client.post("/api/homework/grade", headers=student_headers,
+                           json={"subject": "数学", "grade": "五年级",
+                                 "question_text": "1+1=？ 学生答案=2"})
+        body = j(resp)
+        assert body["code"] != 0
+        assert "批改服务暂时不可用" in body.get("msg", "")
+        assert logged, "内部异常应被记录到日志"
+
 
 # =====================================================================
 # 错题 CRUD Epic-05
@@ -353,6 +397,37 @@ class TestMistakesCRUD:
         assert items_legacy[0]["question"] == "苏科版题目"
 
     @pytest.mark.integration
+    def test_list_mistakes_paginated(self, client, student_headers, sandbox_config):
+        """D-08：传分页参数返回 {items,total,page,page_size}；不传则保持旧数组行为。"""
+        import config, sqlite3
+        db_path = str(config.DB_PATH)
+        conn = sqlite3.connect(db_path)
+        uid = conn.execute("SELECT id FROM users WHERE username='student'").fetchone()[0]
+        conn.close()
+        self._insert_mistakes(db_path, uid, [
+            ("数学", "分页题1", 0, "X"),
+            ("数学", "分页题2", 0, "X"),
+            ("数学", "分页题3", 0, "X"),
+        ])
+
+        data = j(client.get("/api/mistakes?page=1&page_size=2",
+                            headers=student_headers))["data"]
+        assert isinstance(data, dict)
+        assert data["total"] == 3
+        assert data["page"] == 1
+        assert data["page_size"] == 2
+        assert len(data["items"]) == 2
+
+        # 第 2 页只剩 1 条
+        data2 = j(client.get("/api/mistakes?page=2&page_size=2",
+                             headers=student_headers))["data"]
+        assert len(data2["items"]) == 1
+
+        # 不传分页参数 → 旧行为：返回数组
+        legacy = j(client.get("/api/mistakes", headers=student_headers))["data"]
+        assert isinstance(legacy, list)
+
+    @pytest.mark.integration
     def test_toggle_mastered_updates_db(self, client, student_headers, sandbox_config):
         import config, sqlite3
         db_path = str(config.DB_PATH)
@@ -455,6 +530,27 @@ class TestKnowledgeAPI:
         assert got["deepseek_model"] == "deepseek-v3-turbo"
         assert got["chunk_size"] == 600
         assert got["top_k"] == 10
+
+    @pytest.mark.integration
+    def test_settings_reject_overlap_ge_chunk_size(self, client, admin_headers):
+        """D-01：chunk_overlap 不小于 chunk_size 时拒绝，避免切片步长退化为 1。"""
+        resp = client.put("/api/settings", headers=admin_headers,
+                          json={"chunk_size": 200, "chunk_overlap": 300})
+        assert j(resp)["code"] != 0
+        assert "chunk_overlap" in j(resp).get("msg", "")
+
+    @pytest.mark.integration
+    def test_settings_reject_out_of_range_values(self, client, admin_headers):
+        """D-01：top_k / min_score 越界时拒绝。"""
+        for payload, key in (
+            ({"top_k": 0}, "top_k"),
+            ({"top_k": 99}, "top_k"),
+            ({"min_score": 1.5}, "min_score"),
+            ({"chunk_size": 10}, "chunk_size"),
+        ):
+            resp = client.put("/api/settings", headers=admin_headers, json=payload)
+            assert j(resp)["code"] != 0, f"{payload} 应被拒绝"
+            assert key in j(resp).get("msg", "")
 
     @pytest.mark.integration
     def test_knowledge_search_returns_expected_structure(self, client, admin_headers, rag_engine_sandbox,

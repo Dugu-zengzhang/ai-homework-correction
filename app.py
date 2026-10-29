@@ -8,8 +8,10 @@
 import datetime
 from datetime import timezone as _dt_timezone
 import json
+import logging
 import os
 import sqlite3
+import time
 import uuid
 from functools import wraps
 
@@ -25,6 +27,20 @@ import ocr_service
 from rag_engine import rag_engine
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+# 批改链路运行日志（D-11）：写入 logs/app.log，目录已被 .gitignore 忽略
+logger = logging.getLogger("ai_homework_check")
+if not logger.handlers:
+    _log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _handler = logging.FileHandler(
+        os.path.join(_log_dir, "app.log"), encoding="utf-8"
+    )
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s"
+    ))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 # ========================= 数据库 =========================
@@ -243,16 +259,40 @@ def register():
     return ok({"token": make_token(user), "user": public_user(user)}, "注册成功")
 
 
+# 登录失败计数与临时锁定（D-03）：内存态，进程内有效；同账号连续失败 5 次锁 5 分钟
+_LOGIN_LOCK_THRESHOLD = 5
+_LOGIN_LOCK_SECONDS = 300
+_login_attempts = {}  # username -> {"fail": int, "locked_until": float}
+
+
 @app.post("/api/auth/login")
 def login():
     data = request.get_json(silent=True) or {}
     username = (data.get("username") or "").strip()
     password = data.get("password") or ""
+
+    # 命中锁定则直接拒绝，不查询数据库
+    now = time.monotonic()
+    state = _login_attempts.get(username)
+    if state and state.get("locked_until", 0) > now:
+        remain = int(state["locked_until"] - now)
+        return fail(f"登录尝试过于频繁，请在 {remain} 秒后重试", 429, 429)
+
     row = get_db().execute(
         "SELECT * FROM users WHERE username=?", (username,)
     ).fetchone()
     if not row or not check_password_hash(row["password_hash"], password):
+        # 记录失败；连续失败达到阈值则锁定
+        state = _login_attempts.setdefault(username, {"fail": 0, "locked_until": 0})
+        state["fail"] += 1
+        if state["fail"] >= _LOGIN_LOCK_THRESHOLD:
+            state["locked_until"] = time.monotonic() + _LOGIN_LOCK_SECONDS
+            state["fail"] = 0
+            return fail(f"连续失败次数过多，账号已锁定 {_LOGIN_LOCK_SECONDS // 60} 分钟", 429, 429)
         return fail("用户名或密码错误", http_status=401)
+
+    # 登录成功则清零失败记录
+    _login_attempts.pop(username, None)
     user = dict(row)
     return ok({"token": make_token(user), "user": public_user(user)}, "登录成功")
 
@@ -404,6 +444,8 @@ def homework_grade():
     except llm_service.LLMError as exc:
         return fail(str(exc))
     except Exception:
+        # D-11：异常必须落日志，避免线上问题无法定位
+        logger.exception("批改服务异常 user_id=%s subject=%s", g.user["id"], subject)
         return fail("批改服务暂时不可用，请稍后重试")
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -446,21 +488,60 @@ def homework_grade():
 
 # ========================= 批改记录 & 错题本（Epic-05） =========================
 
+def _parse_pagination():
+    """解析分页参数 page / page_size（D-08）。
+
+    两者均未传时返回 (None, None)，保持旧版"全量返回"行为不变；
+    一旦传入分页参数，page 默认 1、page_size 默认 20、上限 100，返回分页结构。
+    """
+    page_raw = request.args.get("page")
+    size_raw = request.args.get("page_size")
+    if page_raw is None and size_raw is None:
+        return None, None
+    try:
+        page = max(int(page_raw or 1), 1)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(size_raw or 20)
+    except (TypeError, ValueError):
+        size = 20
+    size = min(max(size, 1), 100)
+    return page, size
+
+
 @app.get("/api/records")
 @auth_required
 def list_records():
-    rows = get_db().execute(
-        "SELECT id, subject, grade, stage, textbook_version, region, image_path,"
-        " score, created_at FROM records"
-        " WHERE user_id=? ORDER BY id DESC LIMIT 50",
-        (g.user["id"],),
-    ).fetchall()
+    page, page_size = _parse_pagination()
+    db = get_db()
+    if page is not None:
+        total = db.execute(
+            "SELECT COUNT(*) FROM records WHERE user_id=?", (g.user["id"],)
+        ).fetchone()[0]
+        rows = db.execute(
+            "SELECT id, subject, grade, stage, textbook_version, region, image_path,"
+            " score, created_at FROM records WHERE user_id=?"
+            " ORDER BY id DESC LIMIT ? OFFSET ?",
+            (g.user["id"], page_size, (page - 1) * page_size),
+        ).fetchall()
+    else:
+        rows = db.execute(
+            "SELECT id, subject, grade, stage, textbook_version, region, image_path,"
+            " score, created_at FROM records"
+            " WHERE user_id=? ORDER BY id DESC LIMIT 50",
+            (g.user["id"],),
+        ).fetchall()
+
     items = []
     for r in rows:
         item = dict(r)
         if item.get("image_path"):
             item["image_url"] = f"/uploads/{item['image_path']}"
         items.append(item)
+
+    if page is not None:
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     return ok(items)
 
 
@@ -475,38 +556,56 @@ def list_mistakes():
     grade = request.args.get("grade", "").strip()
     keyword = request.args.get("keyword", "").strip()
     mastered = request.args.get("mastered", "").strip()
+    page, page_size = _parse_pagination()
 
-    sql = ("SELECT id, subject, grade, stage, textbook_version, question,"
-           " student_answer, correct_answer, knowledge_point, error_reason,"
-           " analysis, image_path, mastered, created_at"
-           " FROM mistakes WHERE user_id=?")
+    where = " WHERE user_id=?"
     params = [g.user["id"]]
     if subject:
-        sql += " AND subject=?"
+        where += " AND subject=?"
         params.append(subject)
     if stage:
-        sql += " AND stage=?"
+        where += " AND stage=?"
         params.append(stage)
     if textbook:
-        sql += " AND textbook_version=?"
+        where += " AND textbook_version=?"
         params.append(textbook)
     if grade:
-        sql += " AND grade=?"
+        where += " AND grade=?"
         params.append(grade)
     if mastered in ("0", "1"):
-        sql += " AND mastered=?"
+        where += " AND mastered=?"
         params.append(int(mastered))
     if keyword:
-        sql += " AND (question LIKE ? OR knowledge_point LIKE ?)"
+        where += " AND (question LIKE ? OR knowledge_point LIKE ?)"
         params.extend([f"%{keyword}%", f"%{keyword}%"])
-    sql += " ORDER BY id DESC LIMIT 200"
+
+    db = get_db()
+    total = None
+    if page is not None:
+        total = db.execute("SELECT COUNT(*) FROM mistakes" + where, params).fetchone()[0]
+
+    select = ("SELECT id, subject, grade, stage, textbook_version, question,"
+              " student_answer, correct_answer, knowledge_point, error_reason,"
+              " analysis, image_path, mastered, created_at FROM mistakes")
+    if page is not None:
+        rows = db.execute(
+            select + where + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            params + [page_size, (page - 1) * page_size],
+        ).fetchall()
+    else:
+        rows = db.execute(
+            select + where + " ORDER BY id DESC LIMIT 200", params
+        ).fetchall()
 
     items = []
-    for r in get_db().execute(sql, params).fetchall():
+    for r in rows:
         item = dict(r)
         if item.get("image_path"):
             item["image_url"] = f"/uploads/{item['image_path']}"
         items.append(item)
+
+    if page is not None:
+        return ok({"items": items, "total": total, "page": page, "page_size": page_size})
     return ok(items)
 
 
@@ -659,6 +758,7 @@ def get_settings():
         "deepseek_base_url": s.get("deepseek_base_url"),
         "deepseek_model": s.get("deepseek_model"),
         "chunk_size": s.get("chunk_size"),
+        "chunk_overlap": s.get("chunk_overlap"),
         "top_k": s.get("top_k"),
         "min_score": s.get("min_score"),
     })
@@ -675,12 +775,54 @@ def update_settings():
         patch["deepseek_base_url"] = data["deepseek_base_url"].strip()
     if data.get("deepseek_model"):
         patch["deepseek_model"] = data["deepseek_model"].strip()
-    for key in ("chunk_size", "top_k", "min_score"):
-        if data.get(key) is not None:
-            try:
-                patch[key] = float(data[key]) if key == "min_score" else int(data[key])
-            except (TypeError, ValueError):
-                return fail(f"参数 {key} 格式不正确")
+
+    # D-01：数值型参数做范围校验，非法值拒绝并给出可读提示，避免切片步长退化为 1 或检索恒空
+    def _int(key, lo, hi):
+        raw = data.get(key)
+        if raw is None:
+            return None
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"参数 {key} 必须是整数")
+        if not (lo <= val <= hi):
+            raise ValueError(f"参数 {key} 需在 [{lo}, {hi}] 范围内")
+        return val
+
+    def _float(key, lo, hi):
+        raw = data.get(key)
+        if raw is None:
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"参数 {key} 必须是数字")
+        if not (lo <= val <= hi):
+            raise ValueError(f"参数 {key} 需在 [{lo}, {hi}] 范围内")
+        return val
+
+    try:
+        chunk_size = _int("chunk_size", 50, 2000)
+        chunk_overlap = _int("chunk_overlap", 0, 2000)
+        top_k = _int("top_k", 1, 20)
+        min_score = _float("min_score", 0.0, 1.0)
+    except ValueError as exc:
+        return fail(str(exc))
+
+    if chunk_size is not None:
+        patch["chunk_size"] = chunk_size
+    if chunk_overlap is not None:
+        effective_size = chunk_size if chunk_size is not None else int(
+            config.load_settings().get("chunk_size", 500)
+        )
+        if chunk_overlap >= effective_size:
+            return fail(f"chunk_overlap 必须小于 chunk_size（当前 chunk_size={effective_size}）")
+        patch["chunk_overlap"] = chunk_overlap
+    if top_k is not None:
+        patch["top_k"] = top_k
+    if min_score is not None:
+        patch["min_score"] = min_score
+
     config.save_settings(patch)
     return ok(msg="设置已保存")
 
