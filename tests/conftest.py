@@ -42,41 +42,23 @@ def tmp_db_path(tmp_path):
 
 
 @pytest.fixture()
-def init_tmp_db(tmp_db_path):
-    """在临时数据库上执行 app.init_db() 的建表逻辑，并返回路径。"""
+def init_tmp_db(tmp_db_path, monkeypatch):
+    """在临时数据库上执行 app.init_db() 的建表逻辑，并返回路径。
+
+    D-05：建表 DDL 只在 app.py 维护一份，测试基座不再复制 schema，
+    新增字段只改 app.py 即可，避免两处不同步。
+    """
     import datetime
     from werkzeug.security import generate_password_hash
 
+    import config as config_module
+    monkeypatch.setattr(config_module, "DB_PATH", Path(tmp_db_path))
+
+    import app as app_module
+    app_module.init_db()
+
+    # app.init_db() 只内置 admin / student；测试额外需要 alice / bob 做越权用例
     conn = sqlite3.connect(tmp_db_path)
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'user',
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            subject TEXT, grade TEXT,
-            image_path TEXT, question_text TEXT,
-            score TEXT, result_json TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS mistakes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            record_id INTEGER,
-            subject TEXT, question TEXT, student_answer TEXT,
-            correct_answer TEXT, knowledge_point TEXT,
-            error_reason TEXT, analysis TEXT, image_path TEXT,
-            mastered INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def add_user(name, pwd, role):
@@ -85,8 +67,6 @@ def init_tmp_db(tmp_db_path):
             (name, generate_password_hash(pwd), role, now),
         )
 
-    add_user("admin", "admin123", "admin")
-    add_user("student", "123456", "user")
     add_user("alice", "123456", "user")
     add_user("bob", "123456", "user")
     conn.commit()
