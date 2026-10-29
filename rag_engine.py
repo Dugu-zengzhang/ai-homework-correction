@@ -17,15 +17,22 @@
 不报错、不退化为空库，管理员可通过 update_doc_labels 逐步补打标签。
 """
 import json
+import logging
 import math
 import os
 import re
 import threading
+import xml.etree.ElementTree as ET
 import zipfile
 from collections import Counter
 from datetime import datetime
 
 import config
+
+logger = logging.getLogger(__name__)
+
+# WordprocessingML 命名空间
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 # ----------------------------- 文档解析 -----------------------------
@@ -42,16 +49,53 @@ def _read_txt(path: str) -> str:
     return raw or ""
 
 
+def _docx_node_text(node) -> str:
+    """拼接节点内全部 <w:t> 文本（含 run / 超链接等嵌套结构）。"""
+    return "".join(t.text or "" for t in node.iter(f"{_W}t")).strip()
+
+
 def _read_docx(path: str) -> str:
-    paragraphs = []
+    """解析 docx 正文与表格（D-09）。
+
+    用 XML 解析而非正则：正则会误把 `<w:tblPr>` 等标签当成 `<w:t>` 文本，
+    且无法区分「段落」与「表格行」。这里按 body 顺序输出：
+    - 普通段落：一行文本；
+    - 表格：每行输出 `单元格1 | 单元格2 | ...`，保证表格内容可被切片入库并检索命中。
+    """
     with zipfile.ZipFile(path) as z:
         xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
-    for para in re.split(r"</w:p>", xml):
-        texts = re.findall(r"<w:t[^>]*>(.*?)</w:t>", para, re.S)
-        line = "".join(texts).strip()
-        if line:
-            paragraphs.append(line)
-    return "\n".join(paragraphs)
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        # 极端损坏的文档：退化为纯文本兜底，避免整份资料无法入库
+        return "\n".join(
+            line.strip()
+            for line in re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", xml, re.S)
+            if line.strip()
+        )
+
+    body = root.find(f"{_W}body")
+    if body is None:
+        body = root
+
+    lines = []
+    for child in body:
+        if child.tag == f"{_W}p":
+            text = _docx_node_text(child)
+            if text:
+                lines.append(text)
+        elif child.tag == f"{_W}tbl":
+            for row in child.findall(f"{_W}tr"):
+                cells = []
+                for cell in row.findall(f"{_W}tc"):
+                    cell_text = " ".join(
+                        t for t in (_docx_node_text(p) for p in cell.iter(f"{_W}p")) if t
+                    )
+                    if cell_text:
+                        cells.append(cell_text)
+                if cells:
+                    lines.append(" | ".join(cells))
+    return "\n".join(lines)
 
 
 def _read_pdf(path: str) -> str:
@@ -205,19 +249,45 @@ class RAGEngine:
         self.chunks = []
         self.vectors = []
         self.embedder = TfidfEmbedder()
+        self.index_status = {"status": "unknown", "message": "索引尚未加载"}
         self._load()
         self._rebuild_vectors()
 
     # -------- 持久化 --------
     def _load(self) -> None:
-        if os.path.exists(self.index_path):
-            try:
-                with open(self.index_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.docs = data.get("docs", [])
-                self.chunks = data.get("chunks", [])
-            except Exception:
-                self.docs, self.chunks = [], []
+        """加载索引，并把加载结果写入 self.index_status（D-06）。
+
+        索引损坏时不再静默回退空库：记录 corrupt 状态与原因（stats 可见），
+        同时保持空库可启动，且不覆盖损坏文件，便于管理员排查/替换。
+        """
+        if not os.path.exists(self.index_path):
+            self.index_status = {
+                "status": "missing",
+                "message": "索引文件不存在，按空库启动（首次入库后自动创建）",
+            }
+            return
+        try:
+            with open(self.index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("索引顶层结构不是 JSON 对象")
+            docs = data.get("docs", [])
+            chunks = data.get("chunks", [])
+            if not isinstance(docs, list) or not isinstance(chunks, list):
+                raise ValueError("docs / chunks 字段不是数组")
+            self.docs, self.chunks = docs, chunks
+            self.index_status = {
+                "status": "ok",
+                "message": f"已加载 {len(docs)} 份资料 / {len(chunks)} 个切片",
+            }
+        except Exception as exc:  # 损坏的 JSON / 结构异常
+            self.docs, self.chunks = [], []
+            detail = f"{type(exc).__name__}: {exc}"
+            self.index_status = {
+                "status": "corrupt",
+                "message": f"索引文件损坏，已按空库启动（未覆盖原文件）：{detail}",
+            }
+            logger.warning("RAG 索引加载失败：%s（文件：%s）", detail, self.index_path)
 
     def _save(self) -> None:
         tmp = self.index_path + ".tmp"
@@ -227,6 +297,10 @@ class RAGEngine:
                 f, ensure_ascii=False,
             )
         os.replace(tmp, self.index_path)
+        self.index_status = {
+            "status": "ok",
+            "message": f"已加载 {len(self.docs)} 份资料 / {len(self.chunks)} 个切片",
+        }
 
     def _rebuild_vectors(self) -> None:
         tokens = [tokenize(c["content"]) for c in self.chunks]
@@ -412,6 +486,7 @@ class RAGEngine:
                 "chunk_count": len(self.chunks),
                 "folder": self.knowledge_dir,
                 "docs": self.docs,
+                "index_status": dict(self.index_status),
             }
 
 
