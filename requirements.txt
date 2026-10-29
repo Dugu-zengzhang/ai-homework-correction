@@ -5,5 +5,4 @@ pypdf>=4.0
 
 # 可选：本地 OCR（需另行安装 Tesseract OCR 引擎并配置中文语言包 chi_sim）
 # 未安装时平台自动降级为“手动录入/修正识别文本”，不影响批改主链路
-# pytesseract>=0.3.10
-# pillow>=10.0
+# 需要启用时执行：pip install -r requirements-ocr.txt（附安装与验证步骤）

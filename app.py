@@ -190,6 +190,31 @@ def page_app():
 
 @app.route("/uploads/<path:filename>")
 def uploaded_file(filename):
+    """作业原图访问：必须携带有效登录态（Authorization 头或 ?token= 查询参数）。
+
+    前端 <img> 无法携带自定义请求头，因此同时支持 ?token=；
+    已落库的图片仅本人与管理员可读，避免作业原图被其他账号直接拉取。
+    """
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else (request.args.get("token") or "")
+    payload = None
+    if token:
+        try:
+            payload = jwt.decode(token, config.JWT_SECRET,
+                                 algorithms=[config.JWT_ALGORITHM])
+        except jwt.InvalidTokenError:
+            payload = None
+    if not payload:
+        return fail("未登录，请先登录", 401, 401)
+
+    name = os.path.basename(filename)
+    row = get_db().execute(
+        "SELECT user_id FROM records WHERE image_path=?"
+        " UNION SELECT user_id FROM mistakes WHERE image_path=? LIMIT 1",
+        (name, name),
+    ).fetchone()
+    if row and row["user_id"] != payload["uid"] and payload["role"] != "admin":
+        return fail("无权访问该图片", 403, 403)
     return send_from_directory(str(config.UPLOAD_DIR), filename)
 
 
@@ -357,8 +382,9 @@ def homework_grade():
     if not question_text:
         return fail("作业题目内容为空，请识别或手动录入后再提交")
 
-    # 五级字典校验：字典外的学段/学科/教材版本/年级一律拒绝，不静默入库
-    valid, msg = dict_service.validate_selection(stage, subject, textbook_version, grade)
+    # 五级字典校验：字典外的学段/学科/教材版本/年级/地区一律拒绝，不静默入库
+    valid, msg = dict_service.validate_selection(stage, subject, textbook_version,
+                                                 grade, region)
     if not valid:
         return fail(msg)
 
@@ -443,7 +469,9 @@ def list_records():
 def list_mistakes():
     subject = request.args.get("subject", "").strip()
     stage = request.args.get("stage", "").strip()
-    textbook = request.args.get("textbook", "").strip()
+    # 前端提交字段为 textbook_version，同时兼容 textbook 别名
+    textbook = (request.args.get("textbook_version")
+                or request.args.get("textbook") or "").strip()
     grade = request.args.get("grade", "").strip()
     keyword = request.args.get("keyword", "").strip()
     mastered = request.args.get("mastered", "").strip()

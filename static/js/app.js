@@ -9,6 +9,13 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
+/* 图片地址附加登录态：<img> 无法携带 Authorization 头，服务端 /uploads 支持 ?token= 校验 */
+function imgUrl(url) {
+  if (!url) return "";
+  const sep = url.includes("?") ? "&" : "?";
+  return url + sep + "token=" + encodeURIComponent(localStorage.getItem("token") || "");
+}
+
 function toast(msg, type = "") {
   const el = $("toast");
   el.textContent = msg;
@@ -269,7 +276,7 @@ async function handleImage(file) {
   try {
     const data = await api("/api/homework/upload", { method: "POST", body: fd });
     currentImage = { image_name: data.image_name, image_url: data.image_url };
-    $("image-preview").src = data.image_url;
+    $("image-preview").src = imgUrl(data.image_url);
     $("image-preview").style.display = "";
     if (data.ocr_text) $("question-text").value = data.ocr_text;
     $("ocr-note").textContent =
@@ -408,7 +415,7 @@ async function loadMistakes() {
         <p><span class="label" style="color:var(--success);font-size:12px;font-weight:700;">正确答案：</span>${escapeHtml(m.correct_answer || "")}</p>
         ${m.error_reason ? `<p><span class="label" style="color:var(--text-3);font-size:12px;font-weight:700;">错误原因：</span>${escapeHtml(m.error_reason)}</p>` : ""}
         <p><span class="label" style="color:var(--text-3);font-size:12px;font-weight:700;">解析：</span>${escapeHtml(m.analysis || "")}</p>
-        ${m.image_url ? `<img class="thumb" src="${m.image_url}" onclick="showImage('${m.image_url}')" alt="原图">` : ""}
+        ${m.image_url ? `<img class="thumb" src="${escapeHtml(imgUrl(m.image_url))}" onclick="showImage('${m.image_url}')" alt="原图">` : ""}
       </div>`).join("");
   } catch (e) {
     listEl.innerHTML = "";
@@ -433,7 +440,7 @@ async function deleteMistake(id) {
 }
 
 function showImage(url) {
-  showModal("作业原图", `<img src="${url}" alt="作业原图">`);
+  showModal("作业原图", `<img src="${escapeHtml(imgUrl(url))}" alt="作业原图">`);
 }
 
 /* ============ 知识库管理 ============ */

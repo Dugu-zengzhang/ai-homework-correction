@@ -90,7 +90,8 @@ def stage_of_grade(grade: str) -> str:
 
 
 def validate_selection(stage: str = "", subject: str = "",
-                       textbook: str = "", grade: str = "") -> tuple:
+                       textbook: str = "", grade: str = "",
+                       region: str = "") -> tuple:
     """校验五级选择的合法性，返回 (ok, msg)。
 
     兼容策略（Web 前端 T-B03 完成前不断链）：
@@ -108,6 +109,10 @@ def validate_selection(stage: str = "", subject: str = "",
 
     if stage not in stages:
         return False, f"学段「{stage}」不在字典范围内"
+
+    region = (region or "").strip()
+    if region and region not in regions():
+        return False, f"地区「{region}」不在字典范围内"
 
     subject = (subject or "").strip()
     if subject and subject not in subjects_of(stage):

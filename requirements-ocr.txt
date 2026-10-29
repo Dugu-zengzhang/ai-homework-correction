@@ -1,0 +1,17 @@
+# =========================================================================
+#  可选依赖：本地 OCR（拍照/截图 → 自动识别题目文字）
+#
+#  未安装时平台自动降级为「手动录入/修正识别文本」，AI 批改主链路不受影响。
+#
+#  安装步骤：
+#    1) pip install -r requirements-ocr.txt
+#    2) 安装 Tesseract 引擎
+#       Windows：https://github.com/UB-Mannheim/tesseract/wiki
+#       安装时勾选 Chinese (Simplified)，或把 chi_sim.traineddata 放入 tessdata 目录
+#    3) 确认引擎在 PATH 中：tesseract --version
+#    4) 验证是否真的启用：
+#       python -c "import ocr_service; print(ocr_service.ocr_image('screenshots/login.png')['engine'])"
+#       输出 tesseract = 已启用；输出 manual = 仍在降级模式
+# =========================================================================
+pytesseract>=0.3.10
+pillow>=10.0

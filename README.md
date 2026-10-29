@@ -135,7 +135,7 @@ python run.py
 
 ---
 
-## ✅ 跑自动化测试（60 条全绿）
+## ✅ 跑自动化测试（112 条，默认 110 条全绿）
 
 ### 方式 1：⭐ 一键脚本（推荐，无真实 LLM 调用 / 不花钱）
 
@@ -143,7 +143,7 @@ python run.py
 python run_tests.py
 ```
 
-默认跑：Unit 29 + Integration 27 + E2E 4 = **60 条用例**，60 passed, 0 failed。
+默认跑：Unit 68 + Integration 38 + E2E 4 = **110 条用例**，110 passed, 0 failed（另有 2 条标记 `require_llm` / `require_ocr` 的用例默认跳过）。
 
 ### 方式 2：按需切换模式
 
@@ -177,8 +177,8 @@ pytest tests -v --tb=short -m "not require_llm and not require_ocr and not slow"
 
 | 层级 | 用例数 | 覆盖的 Jira 测试方案编号 |
 |------|-------|------------------------|
-| Unit | 29 | OCR-01/03、RAG-01~05/07/09/11/12、AI-05/06/07/09 |
-| Integration | 27 | AUTH-01~11、批改参数校验、错题 CRUD（E2E-03/04/05）、知识库 RAG-08/09/10 |
+| Unit | 69 | OCR-01/03、RAG-01~05/07/09/11/12、AI-05/06/07/09、字典五级校验（含地区） |
+| Integration | 38 | AUTH-01~11、批改参数与地区校验、错题 CRUD（E2E-03/04/05）、作业原图访问控制、知识库 RAG-08/09/10 |
 | E2E（Mock LLM） | 4 | ⭐ **E2E-01 主链路：批改→错题自动落库** ×2 / E2E-02 数据隔离 / E2E-07 设置生效 |
 | E2E（真实 LLM） | 1 | 真实 DeepSeek API 回归 2 道错题（需 `--with-llm --slow`） |
 
@@ -188,6 +188,21 @@ pytest tests -v --tb=short -m "not require_llm and not require_ocr and not slow"
 
 ### Q1：我没装 Tesseract-OCR，会影响 AI 批改吗？
 **不影响。** 项目设计了**优雅降级**（[ocr_service.py](ocr_service.py)）：没装 pytesseract 或 Tesseract 引擎时，OCR 返回空文本，前端文本框会亮起并显示提示"请手动录入或修改识别内容"。学生手动输入题目后照样能提交批改，主链路 100% 可用。
+
+**想真正启用自动识别**（三步）：
+
+```bash
+# 1) 安装 Python 侧依赖（与主依赖分开，不装也不影响运行）
+pip install -r requirements-ocr.txt
+
+# 2) 安装 Tesseract 引擎
+#    Windows: https://github.com/UB-Mannheim/tesseract/wiki（安装时勾选 Chinese (Simplified)）
+#    并把 Tesseract 安装目录加入 PATH
+
+# 3) 验证是否真的启用
+python -c "import ocr_service; print(ocr_service.ocr_image('screenshots/login.png')['engine'])"
+#    输出 tesseract = 已启用；输出 manual = 仍在降级模式
+```
 
 ### Q2：DeepSeek Key 没配会怎么样？
 **批改接口会返回友好错误 + 不抛异常堆栈**（[llm_service.py](llm_service.py)），前端弹 Toast 提示"请联系管理员配置 DeepSeek API Key"。其它功能（注册登录、错题本增删改查、知识库上传与检索测试）照常使用。

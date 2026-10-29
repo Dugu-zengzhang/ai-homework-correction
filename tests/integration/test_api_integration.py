@@ -226,6 +226,18 @@ class TestHomeworkGradeAPI:
         assert data["code"] != 0, "无 Key 时批改不能成功"
         assert "DeepSeek" in data.get("msg", "") or "API Key" in data.get("msg", "")
 
+    @pytest.mark.integration
+    def test_grade_invalid_region_rejected(self, client, student_headers):
+        """字典外的地区一律拒绝（整改项 CR-15：region 此前未参与校验）。"""
+        resp = client.post("/api/homework/grade",
+                           headers=student_headers,
+                           json={"subject": "数学", "grade": "七年级上", "stage": "初中",
+                                 "textbook_version": "人教版", "region": "火星省",
+                                 "question_text": "1+1=？ 学生答案=2"})
+        data = j(resp)
+        assert data["code"] != 0
+        assert "地区" in data.get("msg", "")
+
 
 # =====================================================================
 # 错题 CRUD Epic-05
@@ -309,6 +321,36 @@ class TestMistakesCRUD:
         resp = client.get("/api/mistakes?keyword=分数", headers=student_headers)
         items = j(resp)["data"]
         assert len(items) == 1 and items[0]["question"] == "分数加法题"
+
+    @pytest.mark.integration
+    def test_filter_by_textbook_version(self, client, student_headers, sandbox_config):
+        """E2E-05：教材版本筛选（整改项 CR-13：前端发 textbook_version，后端曾只读 textbook）。"""
+        import config, sqlite3
+        db_path = str(config.DB_PATH)
+        conn = sqlite3.connect(db_path)
+        uid = conn.execute("SELECT id FROM users WHERE username='student'").fetchone()[0]
+        for name, tb in (("人教版题目", "人教版"), ("苏科版题目", "苏科版")):
+            conn.execute(
+                "INSERT INTO mistakes (user_id, subject, grade, stage, textbook_version,"
+                " question, correct_answer, knowledge_point, mastered, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,0,?)",
+                (uid, "数学", "七年级上", "初中", tb, name, "参考答案", "X",
+                 "2026-01-01 00:00:00"),
+            )
+        conn.commit()
+        conn.close()
+
+        # 前端实际提交的参数名
+        items = j(client.get("/api/mistakes?textbook_version=人教版",
+                             headers=student_headers))["data"]
+        assert len(items) == 1, f"教材版本筛选失效：{items}"
+        assert items[0]["question"] == "人教版题目"
+
+        # 旧参数名仍兼容
+        items_legacy = j(client.get("/api/mistakes?textbook=苏科版",
+                                    headers=student_headers))["data"]
+        assert len(items_legacy) == 1
+        assert items_legacy[0]["question"] == "苏科版题目"
 
     @pytest.mark.integration
     def test_toggle_mastered_updates_db(self, client, student_headers, sandbox_config):
@@ -432,3 +474,64 @@ class TestKnowledgeAPI:
             for k in ("doc_id", "doc_name", "chunk_index", "content", "score"):
                 assert k in first, f"检索结果缺少字段 {k}"
             assert 0.0 <= first["score"] <= 1.0
+
+
+# =====================================================================
+# 作业原图访问控制（整改项 CR-14：/uploads 曾完全公开）
+# =====================================================================
+class TestUploadImageAccess:
+    """作业原图必须登录后可读，且仅本人与管理员可读。"""
+
+    IMAGE = "audit_cr14.png"
+
+    @staticmethod
+    def _prepare(sandbox_config):
+        """在沙箱上传目录放一张图，并给 student 落一条批改记录指向它。"""
+        import config, sqlite3
+
+        (Path(sandbox_config["UPLOAD_DIR"]) / TestUploadImageAccess.IMAGE).write_bytes(
+            b"\x89PNG\r\n\x1a\n fake image bytes"
+        )
+        conn = sqlite3.connect(str(config.DB_PATH))
+        uid = conn.execute("SELECT id FROM users WHERE username='student'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO records (user_id, subject, grade, stage, textbook_version,"
+            " image_path, question_text, score, result_json, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (uid, "数学", "七年级上", "初中", "人教版", TestUploadImageAccess.IMAGE,
+             "题目", "", "{}", "2026-01-01 00:00:00"),
+        )
+        conn.commit()
+        conn.close()
+
+    @pytest.mark.integration
+    def test_anonymous_access_rejected(self, client, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}")
+        assert resp.status_code == 401
+
+    @pytest.mark.integration
+    def test_owner_can_read_image(self, client, student_headers, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}", headers=student_headers)
+        assert resp.status_code == 200
+        assert resp.data.startswith(b"\x89PNG")
+
+    @pytest.mark.integration
+    def test_other_user_forbidden(self, client, bob_headers, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}", headers=bob_headers)
+        assert resp.status_code == 403
+
+    @pytest.mark.integration
+    def test_admin_can_read_image(self, client, admin_headers, sandbox_config):
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}", headers=admin_headers)
+        assert resp.status_code == 200
+
+    @pytest.mark.integration
+    def test_token_query_param_accepted(self, client, student_token, sandbox_config):
+        """<img src> 无法带请求头，因此 ?token= 也必须可用。"""
+        self._prepare(sandbox_config)
+        resp = client.get(f"/uploads/{self.IMAGE}?token={student_token}")
+        assert resp.status_code == 200
