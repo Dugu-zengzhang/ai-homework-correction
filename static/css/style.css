@@ -200,3 +200,24 @@ a { text-decoration: none; color: var(--primary); }
 .modal img { max-width: 100%; border-radius: 8px; }
 .empty { text-align: center; color: var(--text-3); padding: 44px 0; }
 .empty .ico { font-size: 40px; display: block; margin-bottom: 8px; }
+
+/* T-E10 ③：字典接口降级提示（页面顶部一次性横幅） */
+.dict-banner {
+  background: #fff8e6; border: 1px solid #f5d78e; color: #8a5a00;
+  border-radius: 10px; padding: 10px 16px; margin-bottom: 16px;
+  font-size: 13px; line-height: 1.6;
+}
+
+/* T-E10 ①：列表分页 */
+.pager { display: flex; align-items: center; justify-content: center; gap: 14px; padding: 14px 0 2px; }
+.pager-info { font-size: 12.5px; color: var(--text-3); }
+.pager .mini-btn:disabled { background: #f0f1f4; color: #a8adb8; cursor: not-allowed; }
+
+/* T-E10 ①：批改记录列表 */
+.record-row {
+  display: flex; align-items: center; gap: 10px; padding: 9px 4px;
+  border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.record-row:last-child { border-bottom: none; }
+.record-time { color: var(--text-3); min-width: 150px; }
+.record-score { margin-left: auto; font-weight: 700; color: var(--primary); }

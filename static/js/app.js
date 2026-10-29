@@ -34,14 +34,24 @@ async function api(url, options = {}) {
     opts.body = JSON.stringify(opts.jsonBody);
     delete opts.jsonBody;
   }
-  const resp = await fetch(url, opts);
+  let resp;
+  try {
+    resp = await fetch(url, opts);
+  } catch (e) {
+    // T-E10 ②：网络层失败给出可读原因，不再统一吞成“请求失败”
+    throw new Error("无法连接服务器，请确认服务已启动后重试");
+  }
   if (resp.status === 401) {
     localStorage.clear();
     location.href = "/";
-    throw new Error("未登录");
+    throw new Error("登录已过期，请重新登录");
   }
-  const data = await resp.json().catch(() => ({ code: -1, msg: "响应解析失败" }));
-  if (data.code !== 0) throw new Error(data.msg || "请求失败");
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    throw new Error((data && data.msg) || `请求失败（HTTP ${resp.status} ${resp.statusText}）`);
+  }
+  if (!data) throw new Error("服务器返回内容无法解析");
+  if (data.code !== 0) throw new Error(data.msg || "请求失败（服务器未返回具体原因）");
   return data.data;
 }
 
@@ -143,12 +153,21 @@ function fillSelect(sel, items, allLabel) {
   items.forEach((t) => sel.append(new Option(t, t)));
 }
 
+let dictBannerShown = false; // T-E10 ③：降级提示只在页面展示一次
 function updateDictNote() {
   const note = $("dict-note");
-  if (!note) return;
-  note.textContent = dictRemoteOK === false
-    ? "⚠️ 字典接口未就绪，当前使用前端内置字典；/api/dict 上线后将自动切换为服务端数据。"
-    : "";
+  if (note) {
+    note.textContent = dictRemoteOK === false
+      ? "⚠️ 字典接口未就绪，当前使用前端内置字典；/api/dict 上线后将自动切换为服务端数据。"
+      : "";
+  }
+  const banner = $("dict-banner");
+  if (banner && dictRemoteOK === false && !dictBannerShown) {
+    banner.textContent =
+      "⚠️ 字典接口（/api/dict）暂不可用，已自动降级为前端内置字典，批改与筛选功能不受影响。";
+    banner.style.display = "";
+    dictBannerShown = true;
+  }
 }
 
 /*
@@ -252,6 +271,25 @@ const filterCascade = setupCascade(
 gradeCascade.init();
 filterCascade.init();
 
+/* ============ 分页（T-E10 ①，与后端 D-08 的 page/page_size 约定一致） ============ */
+const PAGE_SIZE = 20;
+
+function renderPager(el, data, onGo) {
+  if (!el) return;
+  const total = Number(data.total || 0);
+  const page = Number(data.page || 1);
+  const size = Number(data.page_size || PAGE_SIZE);
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (!total) { el.innerHTML = ""; return; }
+  el.innerHTML = `
+    <button class="mini-btn" data-go="prev" ${page <= 1 ? "disabled" : ""}>← 上一页</button>
+    <span class="pager-info">第 ${page} / ${pages} 页，共 ${total} 条</span>
+    <button class="mini-btn" data-go="next" ${page >= pages ? "disabled" : ""}>下一页 →</button>`;
+  el.querySelectorAll("button[data-go]").forEach((btn) => {
+    btn.onclick = () => onGo(btn.dataset.go === "prev" ? page - 1 : page + 1);
+  });
+}
+
 /* ============ 作业批改 ============ */
 const uploader = $("uploader");
 const imageInput = $("image-input");
@@ -310,6 +348,7 @@ $("grade-btn").onclick = async () => {
       },
     });
     renderResult(data);
+    loadRecords(1);
     if (data.wrong_count > 0) {
       toast(`批改完成，已自动收录 ${data.wrong_count} 道错题到错题本`, "success");
     } else {
@@ -371,10 +410,48 @@ function renderResult(data) {
     </div>`;
 }
 
-/* ============ 错题本 ============ */
-$("filter-btn").onclick = loadMistakes;
+/* ============ 批改记录（T-E10 ①：分页展示，默认每页 20 条） ============ */
+let recordPage = 1;
 
-async function loadMistakes() {
+async function loadRecords(page = recordPage) {
+  const listEl = $("record-list");
+  const pagerEl = $("record-pager");
+  listEl.innerHTML = '<div class="empty" style="padding:20px 0;"><span class="ico">⏳</span>加载中…</div>';
+  try {
+    const data = await api(`/api/records?page=${page}&page_size=${PAGE_SIZE}`);
+    recordPage = data.page || 1;
+    $("record-count-tip").textContent = `共 ${data.total} 条`;
+    if (!data.items.length) {
+      listEl.innerHTML = '<div class="empty" style="padding:20px 0;"><span class="ico">📋</span>还没有批改记录，先提交一份作业吧～</div>';
+      pagerEl.innerHTML = "";
+      return;
+    }
+    listEl.innerHTML = data.items.map((r) => `
+      <div class="record-row">
+        <span class="record-time">${escapeHtml(r.created_at || "")}</span>
+        <span class="kp-tag">${escapeHtml(r.subject || "综合")}</span>
+        ${r.grade ? `<span class="kp-tag">${escapeHtml(r.grade)}</span>` : ""}
+        <span class="record-score">${r.score === null || r.score === undefined || r.score === "" ? "未评分" : escapeHtml(r.score) + " 分"}</span>
+        ${r.image_url ? `<button class="mini-btn" data-img="${escapeHtml(r.image_url)}">查看原图</button>` : ""}
+      </div>`).join("");
+    listEl.querySelectorAll("button[data-img]").forEach((btn) => {
+      btn.onclick = () => showImage(btn.dataset.img);
+    });
+    renderPager(pagerEl, data, loadRecords);
+  } catch (e) {
+    listEl.innerHTML = "";
+    pagerEl.innerHTML = "";
+    toast(e.message, "error");
+  }
+}
+
+loadRecords(1);
+
+/* ============ 错题本 ============ */
+let mistakePage = 1;
+$("filter-btn").onclick = () => { mistakePage = 1; loadMistakes(1); };
+
+async function loadMistakes(page = mistakePage) {
   const fsel = filterCascade.current();
   const params = new URLSearchParams({
     // 多级筛选（T-B03）；stage/grade/textbook_version 待 T-B02 后由后端生效，subject 立即生效
@@ -385,12 +462,18 @@ async function loadMistakes() {
     mastered: $("f-mastered").value,
     keyword: $("f-keyword").value.trim(),
   });
+  params.set("page", page);
+  params.set("page_size", PAGE_SIZE);
   const listEl = $("mistake-list");
+  const pagerEl = $("mistake-pager");
   listEl.innerHTML = '<div class="empty"><span class="ico">⏳</span>加载中…</div>';
   try {
-    const items = await api("/api/mistakes?" + params.toString());
+    const data = await api("/api/mistakes?" + params.toString());
+    const items = data.items || [];
+    mistakePage = data.page || 1;
     if (!items.length) {
       listEl.innerHTML = '<div class="empty"><span class="ico">📭</span>还没有错题，去批改一份作业吧～</div>';
+      pagerEl.innerHTML = "";
       return;
     }
     listEl.innerHTML = items.map((m) => `
@@ -417,8 +500,10 @@ async function loadMistakes() {
         <p><span class="label" style="color:var(--text-3);font-size:12px;font-weight:700;">解析：</span>${escapeHtml(m.analysis || "")}</p>
         ${m.image_url ? `<img class="thumb" src="${escapeHtml(imgUrl(m.image_url))}" onclick="showImage('${m.image_url}')" alt="原图">` : ""}
       </div>`).join("");
+    renderPager(pagerEl, data, loadMistakes);
   } catch (e) {
     listEl.innerHTML = "";
+    pagerEl.innerHTML = "";
     toast(e.message, "error");
   }
 }

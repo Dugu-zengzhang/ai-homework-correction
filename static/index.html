@@ -23,6 +23,9 @@
 
   <main class="container">
 
+    <!-- T-E10 ③：字典接口降级的一次性显著提示 -->
+    <div class="dict-banner" id="dict-banner" style="display:none;"></div>
+
     <!-- ============ 作业批改 ============ -->
     <section class="view active" id="view-grade">
       <div class="card">
@@ -76,6 +79,12 @@
       </div>
 
       <div id="result-area"></div>
+
+      <div class="card">
+        <div class="card-title">📋 批改记录 <span class="sub" id="record-count-tip"></span></div>
+        <div id="record-list"></div>
+        <div class="pager" id="record-pager"></div>
+      </div>
     </section>
 
     <!-- ============ 错题本 ============ -->
@@ -114,6 +123,7 @@
           <button class="btn btn-primary" id="filter-btn">筛选</button>
         </div>
         <div id="mistake-list"></div>
+        <div class="pager" id="mistake-pager"></div>
       </div>
     </section>
 
