@@ -405,18 +405,39 @@ def delete_mistake(mistake_id):
 
 # ========================= RAG 知识库管理（Epic-03，管理员） =========================
 
+def _public_doc(doc: dict) -> dict:
+    """对外可见的资料字段（D-02）：去掉服务器绝对路径等敏感信息。"""
+    return {k: v for k, v in doc.items() if k not in ("path", "source")}
+
+
 @app.get("/api/knowledge/stats")
 @auth_required
 def knowledge_stats():
+    """知识库统计：所有登录用户可读基础统计；
+    服务器目录（folder）与资料绝对路径仅管理员可见（D-02）。"""
     stats = rag_engine.stats()
-    stats["llm"] = llm_service.llm_status()
-    return ok(stats)
+    is_admin = g.user["role"] == "admin"
+    payload = {
+        "doc_count": stats.get("doc_count", 0),
+        "chunk_count": stats.get("chunk_count", 0),
+        "index_status": stats.get("index_status"),
+        "llm": llm_service.llm_status(),
+        "docs": stats.get("docs", []) if is_admin
+        else [_public_doc(d) for d in stats.get("docs", [])],
+    }
+    if is_admin:
+        payload["folder"] = stats.get("folder")
+    return ok(payload)
 
 
 @app.get("/api/knowledge/docs")
 @auth_required
 def knowledge_docs():
-    return ok(rag_engine.stats()["docs"])
+    """资料列表：管理员可读完整字段；普通用户不返回绝对路径（D-02）。"""
+    docs = rag_engine.stats()["docs"]
+    if g.user["role"] != "admin":
+        docs = [_public_doc(d) for d in docs]
+    return ok(docs)
 
 
 @app.post("/api/knowledge/upload")
